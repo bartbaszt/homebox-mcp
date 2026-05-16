@@ -1,0 +1,30 @@
+{
+  "name": "homebox-mcp",
+  "version": "0.1.0",
+  "description": "Remote HTTP/HTTPS MCP server for one Homebox instance, many collections and users.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "homebox-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "vitest run tests/integration",
+    "test:e2e": "vitest run tests/e2e",
+    "check": "npm run build && npm run test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^4.21.2",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
