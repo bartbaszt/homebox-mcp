@@ -1,6 +1,8 @@
 import { lookup as dnsLookup } from "node:dns/promises";
-import { request as httpRequest, type RequestOptions as HttpRequestOptions } from "node:http";
-import { request as httpsRequest } from "node:https";
+import http from "node:http";
+import https from "node:https";
+import net from "node:net";
+import tls from "node:tls";
 import { isIP } from "node:net";
 import type { IncomingMessage } from "node:http";
 
@@ -645,17 +647,25 @@ export function authHeader(token: string): string {
 }
 
 async function requestPublicUrl(url: URL, signal: AbortSignal): Promise<IncomingMessage> {
-  const requestFn = url.protocol === "https:" ? httpsRequest : httpRequest;
-  const options: HttpRequestOptions = {
+  const { address } = await resolveSafeAddress(url.hostname);
+  const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+  const isTls = url.protocol === "https:";
+  const createConnection = () => {
+    const socket = net.createConnection({ host: address, port, signal });
+    if (!isTls) return socket;
+    return tls.connect({ socket, servername: url.hostname, rejectUnauthorized: true });
+  };
+  const options: https.RequestOptions = {
     protocol: url.protocol,
     hostname: url.hostname,
-    port: url.port,
+    port,
     path: `${url.pathname}${url.search}`,
     method: "GET",
     signal,
-    lookup: safeLookup,
+    createConnection,
     headers: { Accept: "*/*", "User-Agent": "homebox-mcp" },
   };
+  const requestFn = isTls ? https.request : http.request;
 
   return new Promise((resolve, reject) => {
     const req = requestFn(options, resolve);
@@ -663,12 +673,6 @@ async function requestPublicUrl(url: URL, signal: AbortSignal): Promise<Incoming
     req.end();
   });
 }
-
-const safeLookup: HttpRequestOptions["lookup"] = (hostname, options, callback) => {
-  void resolveSafeAddress(hostname, Number(options.family) || undefined)
-    .then(({ address, family }) => callback(null, address, family))
-    .catch((error) => callback(error as Error, "", 0));
-};
 
 async function resolveSafeAddress(hostname: string, family?: number): Promise<{ address: string; family: 4 | 6 }> {
   const familyOption = family === 4 || family === 6 ? family : 0;
