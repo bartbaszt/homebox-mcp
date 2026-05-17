@@ -10,7 +10,7 @@ RUN npm ci
 FROM deps AS build
 COPY tsconfig.json ./
 COPY src ./src
-RUN npm run build
+RUN npm run build && ls -la dist/
 
 FROM base AS runtime
 ENV NODE_ENV=production \
