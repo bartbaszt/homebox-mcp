@@ -4,6 +4,7 @@ import { createServer as createHttpsServer, type Server as HttpsServer } from "n
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express, { type NextFunction, type Request, type Response } from "express";
 
 import { type AppConfig, type OAuthConfig, loadConfig, loadTlsConfig } from "./config.js";
@@ -64,7 +65,7 @@ export function createHttpApp(state: RuntimeState): express.Express {
     res.json({
       ok: true,
       name: "homebox-mcp",
-      transport: "streamable-http",
+      transport: ["streamable-http", "sse"],
       mcpPath: state.config.mcpPath,
       homeboxBaseUrl: state.config.homeboxBaseUrl,
       authRequired: Boolean(state.config.apiToken || oauthConfig(state.config).enabled),
@@ -82,6 +83,38 @@ export function createHttpApp(state: RuntimeState): express.Express {
       });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  const ssePath = `${state.config.mcpPath}/sse`;
+  const sseMessagesPath = `${state.config.mcpPath}/messages`;
+
+  app.get(ssePath, requireMcpAuth(state), async (_req, res) => {
+    const server = createMcpServer(state, authenticatedSession(_req as Request));
+    const transport = new SSEServerTransport(sseMessagesPath, res);
+    res.on("close", () => {
+      void server.close();
+    });
+    await server.connect(transport);
+  });
+
+  app.post(sseMessagesPath, requireMcpAuth(state), async (req, res, next) => {
+    try {
+      const sessionId = req.query.sessionId as string;
+      if (!sessionId) {
+        res.status(400).json({ ok: false, error: "Missing sessionId query parameter" });
+        return;
+      }
+      const server = createMcpServer(state, authenticatedSession(req));
+      const transport = new SSEServerTransport(sseMessagesPath, {} as any);
+      (transport as any).sessionId = sessionId;
+      await server.connect(transport);
+      await transport.handlePostMessage(req, res, req.body);
+      res.on("close", () => {
+        void server.close();
+      });
     } catch (error) {
       next(error);
     }
