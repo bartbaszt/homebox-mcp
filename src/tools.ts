@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { HomeboxClient, JsonObject, QueryValue } from "./homebox-client.js";
 import type { HomeboxSession, SessionStore } from "./session-store.js";
 import { HomeboxMcpError, toSafeError } from "./errors.js";
+import { createItemFull, findOrCreateLocation, replacePrimaryPhoto, resolveTags, uploadPrimaryPhoto, upsertItemsBulk, type BulkUpsertInput, type ItemWorkflowInput } from "./workflows.js";
 
 export interface ToolState {
   homebox: HomeboxClient;
@@ -32,6 +33,101 @@ const base64FileInput = {
   contentType: z.string().min(1).optional(),
 };
 
+const arrayDataOutput = { data: z.array(z.unknown()) };
+const apiSurfaceOutput = { surface: z.enum(["items", "entities"]), cached: z.boolean() };
+const publicSessionOutput = {
+  sessionKey: z.string(),
+  username: z.string().optional(),
+  expiresAt: z.string().optional(),
+  hasAttachmentToken: z.boolean(),
+  createdAt: z.string(),
+  refreshedAt: z.string().optional(),
+};
+const sessionListOutput = { sessions: z.array(z.object(publicSessionOutput)) };
+const logoutOutput = { removed: z.boolean() };
+const downloadedFileOutput = {
+  contentType: z.string().optional(),
+  contentLength: z.number().int().nonnegative(),
+  base64: z.string(),
+  text: z.string().optional(),
+};
+const downloadedAttachmentOutput = { ...downloadedFileOutput, itemId: z.string(), attachmentId: z.string() };
+const downloadedEntityAttachmentOutput = { ...downloadedFileOutput, entityId: z.string(), attachmentId: z.string() };
+const workflowFieldValue = z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(z.union([z.string(), z.number(), z.boolean()]))]);
+const itemWorkflowInput = {
+  name: z.string().min(1),
+  description: z.string().min(1).optional(),
+  quantity: z.number().positive().optional(),
+  purchaseDate: z.string().min(1).optional(),
+  purchasePrice: z.number().nonnegative().optional(),
+  currency: z.string().min(1).optional(),
+  purchaseFrom: z.string().min(1).optional(),
+  externalSource: z.string().min(1).optional(),
+  externalAssetId: z.string().min(1).optional(),
+  orderId: z.string().min(1).optional(),
+  sourceUrls: z.array(z.string().url()).optional(),
+  labels: z.array(z.string().min(1)).optional().describe("Homebox tag names to resolve into tagIds."),
+  locationId: locationId.optional(),
+  locationName: z.string().min(1).optional().describe("Location name or path like Garage/Shelf. Created when createMissingLocation is true."),
+  createMissingTags: z.boolean().optional().default(false),
+  createMissingLocation: z.boolean().optional().default(true),
+  customFields: z.record(workflowFieldValue).optional(),
+  body: jsonObject.optional().describe("Additional Homebox payload merged before workflow fields."),
+  photoUrl: z.string().url().optional().describe("Preferred public image URL for primary photo. Local file paths are not supported."),
+  photoFileName: z.string().min(1).optional(),
+  photoContentType: z.string().min(1).optional(),
+  photoIsPrimary: z.boolean().optional().default(true),
+  dryRun: z.boolean().optional().default(false),
+};
+const tagResolutionOutput = {
+  requested: z.array(z.string()),
+  resolved: z.array(z.object({ name: z.string(), id: z.string().optional(), created: z.boolean(), tag: z.unknown().optional() })),
+  unresolved: z.array(z.string()),
+  toCreate: z.array(z.string()),
+  dryRun: z.boolean(),
+};
+const locationResolutionOutput = {
+  locationId: z.string().optional(),
+  location: z.unknown().optional(),
+  path: z.array(z.string()),
+  created: z.boolean(),
+  matched: z.boolean(),
+  dryRun: z.boolean(),
+  toCreate: z.array(z.string()),
+  unresolved: z.string().optional(),
+};
+const photoUploadOutput = {
+  itemId: z.string(),
+  primary: z.literal(true),
+  source: z.enum(["url", "base64"]),
+  url: z.string().optional(),
+  fileName: z.string().optional(),
+  contentType: z.string().optional(),
+  contentLength: z.number().int().nonnegative().optional(),
+  attachment: z.unknown().optional(),
+};
+const replacePhotoOutput = {
+  ...photoUploadOutput,
+  previousPrimaryAttachmentIds: z.array(z.string()),
+  deletedPreviousPrimaryIds: z.array(z.string()),
+};
+const createItemFullOutput = {
+  dryRun: z.boolean(),
+  payload: z.unknown(),
+  tags: z.unknown(),
+  location: z.unknown().optional(),
+  itemId: z.string().optional(),
+  item: z.unknown().optional(),
+  photo: z.unknown().optional(),
+};
+const bulkUpsertOutput = {
+  dryRun: z.boolean(),
+  created: z.array(z.unknown()),
+  updated: z.array(z.unknown()),
+  skipped: z.array(z.unknown()),
+  errors: z.array(z.unknown()),
+};
+
 export function registerHomeboxTools(server: McpServer, state: ToolState): void {
   server.registerTool(
     "homebox_status",
@@ -50,6 +146,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
       title: "List Homebox Currencies",
       description: "List available Homebox currencies via /api/v1/currency. Current Homebox docs describe this as GET /v1/currency.",
       inputSchema: { ...authInput },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listCurrencies(optionalTokenFrom(args, state)), "Currencies loaded"),
@@ -61,6 +158,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
       title: "Detect Homebox API Surface",
       description: "Probe the connected Homebox instance to detect which API version is available: 'entities' (new Entity Merge API) or 'items' (legacy v0.25.0). Result is cached per server process.",
       inputSchema: { ...authInput },
+      outputSchema: apiSurfaceOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) =>
@@ -82,6 +180,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
         stayLoggedIn: z.boolean().optional().default(true),
         sessionKey: z.string().min(1).optional().describe("Optional caller-chosen session key to overwrite or create."),
       },
+      outputSchema: publicSessionOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     ({ username, password, stayLoggedIn, sessionKey }) =>
@@ -108,6 +207,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
         expiresAt: z.string().min(1).optional(),
         sessionKey: z.string().min(1).optional(),
       },
+      outputSchema: publicSessionOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     ({ token, username, expiresAt, sessionKey }) =>
@@ -120,6 +220,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
       title: "Refresh Homebox Session",
       description: "Refresh a Homebox session token through /api/v1/users/refresh.",
       inputSchema: { sessionKey: z.string().min(1) },
+      outputSchema: publicSessionOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     ({ sessionKey }) =>
@@ -136,6 +237,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
       title: "Logout Homebox Session",
       description: "Remove an in-memory Homebox session from this MCP server.",
       inputSchema: { sessionKey: z.string().min(1) },
+      outputSchema: logoutOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     ({ sessionKey }) => toolResult(() => ({ removed: state.sessions.delete(sessionKey) }), "Session removed"),
@@ -147,6 +249,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
       title: "List In-Memory Sessions",
       description: "List non-secret metadata for sessions currently held by this MCP process.",
       inputSchema: {},
+      outputSchema: sessionListOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     () => toolResult(() => ({ sessions: state.sessions.list() }), "Sessions loaded"),
@@ -158,6 +261,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
       title: "List Homebox Collections",
       description: "List Homebox groups via /api/v1/groups/all. Groups are exposed as MCP collections.",
       inputSchema: { ...authInput },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listCollections(tokenFrom(args, state)), "Collections loaded"),
@@ -252,6 +356,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
 
   registerEntityTools(server, state);
   registerAttachmentTools(server, state);
+  registerWorkflowTools(server, state);
   registerLocationAndFieldTools(server, state);
   registerMaintenanceTools(server, state);
   registerNotifierTools(server, state);
@@ -267,6 +372,7 @@ function registerMaintenanceTools(server: McpServer, state: ToolState): void {
       title: "List Maintenance",
       description: "Query maintenance log across all items via GET /api/v1/maintenance. Defaults to status=both when not provided to avoid v0.25.0 500 error.",
       inputSchema: { ...authInput, status: z.enum(["scheduled", "completed", "both"]).optional() },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listMaintenance(tokenFrom(args, state), args.status), "Maintenance loaded"),
@@ -304,6 +410,7 @@ function registerNotifierTools(server: McpServer, state: ToolState): void {
       title: "List Notifiers",
       description: "List notifiers via GET /api/v1/notifiers.",
       inputSchema: { ...authInput },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listNotifiers(tokenFrom(args, state)), "Notifiers loaded"),
@@ -395,6 +502,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
       title: "Export Entities",
       description: "Export entities CSV via GET /api/v1/entities/export. Returns base64 and text when response is textual.",
       inputSchema: { ...authInput },
+      outputSchema: downloadedFileOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.exportEntities(tokenFrom(args, state)), "Entities exported"),
@@ -427,6 +535,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
       title: "List Entity Field Names",
       description: "List entity custom field names via GET /api/v1/entities/fields.",
       inputSchema: { ...authInput },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listEntityFieldNames(tokenFrom(args, state)), "Entity field names loaded"),
@@ -438,6 +547,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
       title: "List Entity Field Values",
       description: "List distinct values for one entity custom field via GET /api/v1/entities/fields/values?field=<name>.",
       inputSchema: { ...authInput, field: z.string().min(1).describe("Entity custom field name.") },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listEntityFieldValues(tokenFrom(args, state), args.field), "Entity field values loaded"),
@@ -449,6 +559,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
       title: "List Entity Tree",
       description: "Read location/entity tree via GET /api/v1/entities/tree.",
       inputSchema: { ...authInput, withItems: z.boolean().optional().describe("Include items in response tree.") },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listEntitiesTree(tokenFrom(args, state), args.withItems), "Entity tree loaded"),
@@ -533,6 +644,7 @@ function registerEntityAttachmentTools(server: McpServer, state: ToolState): voi
       title: "List Entity Attachments",
       description: "List attachments by reading GET /api/v1/entities/{id}.",
       inputSchema: { ...authInput, entityId },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listEntityAttachments(tokenFrom(args, state), args.entityId), "Entity attachments loaded"),
@@ -579,6 +691,7 @@ function registerEntityAttachmentTools(server: McpServer, state: ToolState): voi
       title: "Download Entity Attachment",
       description: "Download entity attachment via GET /api/v1/entities/{id}/attachments/{attachmentId}; returns base64 within configured size limit. For image content types, returns image content viewable by multimodal models.",
       inputSchema: { ...authInput, entityId, attachmentId },
+      outputSchema: downloadedEntityAttachmentOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.downloadEntityAttachment(tokenFrom(args, state), args.entityId, args.attachmentId), "Entity attachment downloaded"),
@@ -614,6 +727,7 @@ function registerEntityMaintenanceTools(server: McpServer, state: ToolState): vo
       title: "List Entity Maintenance",
       description: "List maintenance log for one entity via GET /api/v1/entities/{id}/maintenance.",
       inputSchema: { ...authInput, entityId, status: z.enum(["scheduled", "completed", "both"]).optional() },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listEntityMaintenance(tokenFrom(args, state), args.entityId, args.status), "Entity maintenance loaded"),
@@ -638,6 +752,7 @@ function registerEntityTypeTools(server: McpServer, state: ToolState): void {
       title: "List Entity Types",
       description: "List entity types via GET /api/v1/entity-types.",
       inputSchema: { ...authInput },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listEntityTypes(tokenFrom(args, state)), "Entity types loaded"),
@@ -684,6 +799,7 @@ function registerEntityTemplateTools(server: McpServer, state: ToolState): void 
       title: "List Entity Templates",
       description: "List entity templates via GET /api/v1/templates.",
       inputSchema: { ...authInput },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listEntityTemplates(tokenFrom(args, state)), "Entity templates loaded"),
@@ -752,6 +868,7 @@ function registerAttachmentTools(server: McpServer, state: ToolState): void {
       title: "List Item Attachments",
       description: "List attachments for a Homebox item by reading item detail.",
       inputSchema: { ...authInput, itemId },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listAttachments(tokenFrom(args, state), args.itemId), "Attachments loaded"),
@@ -763,6 +880,7 @@ function registerAttachmentTools(server: McpServer, state: ToolState): void {
       title: "Download Attachment",
       description: "Download an attachment and return base64 content within configured size limit. For image attachments, returns image content viewable by multimodal models.",
       inputSchema: { ...authInput, itemId, attachmentId },
+      outputSchema: downloadedAttachmentOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.downloadAttachment(tokenFrom(args, state), args.itemId, args.attachmentId), "Attachment downloaded"),
@@ -821,6 +939,127 @@ function registerAttachmentTools(server: McpServer, state: ToolState): void {
   );
 }
 
+function registerWorkflowTools(server: McpServer, state: ToolState): void {
+  const imageUrl = z.string().url().optional().describe("Preferred public image URL. Local file paths are not supported.");
+
+  server.registerTool(
+    "homebox_resolve_tags",
+    {
+      title: "Resolve Tags",
+      description: "Resolve Homebox tag names into tagIds. Can optionally create missing tags via /api/v1/tags.",
+      inputSchema: {
+        ...authInput,
+        labels: z.array(z.string().min(1)).default([]),
+        createMissing: z.boolean().optional().default(false),
+        dryRun: z.boolean().optional().default(false),
+      },
+      outputSchema: tagResolutionOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => resolveTags(state.homebox, tokenFrom(args, state), args), "Tags resolved"),
+  );
+
+  server.registerTool(
+    "homebox_find_or_create_location",
+    {
+      title: "Find Or Create Location",
+      description: "Find a Homebox location by name/path and optionally create missing path segments.",
+      inputSchema: {
+        ...authInput,
+        locationName: z.string().min(1).describe("Location name or path like Garage/Shelf."),
+        parentId: z.string().min(1).optional(),
+        createMissing: z.boolean().optional().default(true),
+        dryRun: z.boolean().optional().default(false),
+      },
+      outputSchema: locationResolutionOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => findOrCreateLocation(state.homebox, tokenFrom(args, state), args), "Location resolved"),
+  );
+
+  server.registerTool(
+    "homebox_create_item_full",
+    {
+      title: "Create Item Full",
+      description: "Workflow create: resolves tags/location, stores external refs as custom fields, creates item, then optionally uploads a primary photo from a public URL.",
+      inputSchema: { ...authInput, ...itemWorkflowInput },
+      outputSchema: createItemFullOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    (args) => toolResult(() => createItemFull(state.homebox, tokenFrom(args, state), args as ItemWorkflowInput), "Item workflow completed"),
+  );
+
+  server.registerTool(
+    "homebox_upload_primary_photo_from_file",
+    {
+      title: "Upload Primary Photo",
+      description: "Upload and set a primary photo. Prefer imageUrl/photoUrl public URLs; base64 is fallback. Local file paths are not supported.",
+      inputSchema: {
+        ...authInput,
+        itemId,
+        imageUrl,
+        photoUrl: imageUrl.describe("Alias for imageUrl."),
+        fileName: z.string().min(1).optional(),
+        base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
+        contentType: z.string().min(1).optional(),
+      },
+      outputSchema: photoUploadOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    (args) =>
+      toolResult(
+        () => uploadPrimaryPhoto(state.homebox, tokenFrom(args, state), { itemId: args.itemId, imageUrl: args.imageUrl ?? args.photoUrl, fileName: args.fileName, base64: args.base64, contentType: args.contentType }),
+        "Primary photo uploaded",
+      ),
+  );
+
+  server.registerTool(
+    "homebox_replace_primary_photo",
+    {
+      title: "Replace Primary Photo",
+      description: "Upload a new primary photo from public URL/base64. Existing primary attachments are only deleted when deletePreviousPrimary=true.",
+      inputSchema: {
+        ...authInput,
+        itemId,
+        imageUrl,
+        photoUrl: imageUrl.describe("Alias for imageUrl."),
+        fileName: z.string().min(1).optional(),
+        base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
+        contentType: z.string().min(1).optional(),
+        deletePreviousPrimary: z.boolean().optional().default(false),
+      },
+      outputSchema: replacePhotoOutput,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    (args) =>
+      toolResult(
+        () => replacePrimaryPhoto(state.homebox, tokenFrom(args, state), { itemId: args.itemId, imageUrl: args.imageUrl ?? args.photoUrl, fileName: args.fileName, base64: args.base64, contentType: args.contentType, deletePreviousPrimary: args.deletePreviousPrimary }),
+        "Primary photo replaced",
+      ),
+  );
+
+  server.registerTool(
+    "homebox_upsert_items_bulk",
+    {
+      title: "Bulk Upsert Items",
+      description: "Create/update many items. Dedupe defaults to External Asset ID, Order ID, then name. Supports dryRun and public photo URLs.",
+      inputSchema: {
+        ...authInput,
+        locationId: locationId.optional(),
+        locationName: z.string().min(1).optional(),
+        createMissingTags: z.boolean().optional().default(false),
+        createMissingLocation: z.boolean().optional().default(true),
+        dedupeBy: z.array(z.enum(["externalAssetId", "orderId", "name"])).min(1).optional(),
+        dryRun: z.boolean().optional().default(false),
+        items: z.array(z.object(itemWorkflowInput)).min(1),
+      },
+      outputSchema: bulkUpsertOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => upsertItemsBulk(state.homebox, tokenFrom(args, state), args as BulkUpsertInput), "Bulk upsert completed"),
+  );
+}
+
 function registerLocationAndFieldTools(server: McpServer, state: ToolState): void {
   server.registerTool(
     "homebox_list_locations",
@@ -872,6 +1111,7 @@ function registerLocationAndFieldTools(server: McpServer, state: ToolState): voi
       title: "List Tags",
       description: "List Homebox tags.",
       inputSchema: { ...authInput },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listTags(tokenFrom(args, state)), "Tags loaded"),
@@ -883,6 +1123,7 @@ function registerLocationAndFieldTools(server: McpServer, state: ToolState): voi
       title: "List Custom Fields",
       description: "List Homebox item custom field definitions.",
       inputSchema: { ...authInput },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listCustomFields(tokenFrom(args, state)), "Custom fields loaded"),
@@ -894,6 +1135,7 @@ function registerLocationAndFieldTools(server: McpServer, state: ToolState): voi
       title: "List Custom Field Values",
       description: "List distinct values for one Homebox custom field. Homebox v0.25.0 requires the field query parameter.",
       inputSchema: { ...authInput, field: z.string().min(1).describe("Custom field name, e.g. one value from homebox_list_custom_fields.") },
+      outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listCustomFieldValues(tokenFrom(args, state), args.field), "Custom field values loaded"),

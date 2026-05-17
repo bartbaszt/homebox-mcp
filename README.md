@@ -11,7 +11,7 @@ The server exposes one configured Homebox instance to external agents over MCP S
 - ChatGPT Apps/Connectors OAuth flow with DCR, protected resource metadata and bearer tokens stored by the MCP client.
 - Homebox username/password login tool; password is never stored.
 - Multiple concurrent users via in-memory session keys.
-- Named tools for status, auth, collections, items, attachments, locations, tags and custom fields.
+- Named tools for status, auth, collections, items, attachments, locations, tags, custom fields and higher-level item workflows.
 - Generic `homebox_api_request` for version-specific `/api/v1/...` endpoints.
 - Safe item update helper that GET-merge-PUTs full payloads to avoid Homebox v0.25.0 partial PUT failures.
 - Auto-detection of Homebox API surface (`items` vs `entities`); single tool set works on both legacy v0.25.0 and the upcoming Entity Merge API.
@@ -152,7 +152,10 @@ With static MCP auth or local agents:
 - Notifiers: `homebox_list_notifiers`, `homebox_create_notifier`, `homebox_test_notifier`, `homebox_update_notifier`, `homebox_delete_notifier`.
 - Attachments: `homebox_list_attachments`, `homebox_download_attachment`, `homebox_upload_attachment`, `homebox_delete_attachment`, `homebox_set_primary_attachment`.
 - Locations/tags/fields: `homebox_list_locations`, `homebox_create_location`, `homebox_update_location`, `homebox_delete_location`, `homebox_list_tags`, `homebox_list_custom_fields`, `homebox_list_custom_field_values` (requires `field`).
+- Workflows: `homebox_resolve_tags`, `homebox_find_or_create_location`, `homebox_create_item_full`, `homebox_upload_primary_photo_from_file`, `homebox_replace_primary_photo`, `homebox_upsert_items_bulk`.
 - Diagnostics: `homebox_api_surface` reports the detected Homebox API version (`items` for legacy v0.25.0, `entities` for the new Entity Merge API).
+
+Workflow photo tools prefer public `imageUrl`/`photoUrl` values. Local paths such as `/mnt/data/...` are not supported; direct `base64` is only a fallback.
 
 ## Multi-Version Compatibility
 

@@ -42,6 +42,14 @@ export interface UploadAttachmentInput {
   primary?: boolean;
 }
 
+export interface PublicUrlFile {
+  url: string;
+  fileName: string;
+  contentType?: string;
+  contentLength: number;
+  base64: string;
+}
+
 export interface UploadEntityAttachmentInput {
   token: string;
   entityId: string;
@@ -421,6 +429,51 @@ export class HomeboxClient {
     });
   }
 
+  async fetchPublicUrlFile(url: string, fileName?: string, contentType?: string): Promise<PublicUrlFile> {
+    let current = publicHttpUrl(url);
+    let response: Response | undefined;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      for (let redirects = 0; redirects <= 5; redirects += 1) {
+        response = await fetch(current, { signal: controller.signal, redirect: "manual" });
+        if (![301, 302, 303, 307, 308].includes(response.status)) break;
+        const location = response.headers.get("location");
+        if (!location) throw new HomeboxMcpError("validation", "Public URL redirect did not include Location header");
+        current = publicHttpUrl(new URL(location, current).toString());
+      }
+
+      if (!response) throw new HomeboxMcpError("network", "Public URL fetch failed before receiving a response");
+      if ([301, 302, 303, 307, 308].includes(response.status)) throw new HomeboxMcpError("validation", "Public URL redirect limit exceeded");
+      if (!response.ok) throw new HomeboxMcpError("network", `Public URL fetch failed (${response.status})`);
+
+      const contentLengthHeader = response.headers.get("content-length");
+      const advertisedLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : undefined;
+      if (advertisedLength && advertisedLength > this.maxUploadBytes) {
+        throw new HomeboxMcpError("validation", `Public URL content exceeds HOMEBOX_MCP_MAX_UPLOAD_BYTES (${this.maxUploadBytes})`);
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.byteLength > this.maxUploadBytes) {
+        throw new HomeboxMcpError("validation", `Public URL content exceeds HOMEBOX_MCP_MAX_UPLOAD_BYTES (${this.maxUploadBytes})`);
+      }
+
+      return {
+        url: current.toString(),
+        fileName: safeFileName(fileName ?? fileNameFromUrl(current) ?? "photo"),
+        contentType: contentType ?? response.headers.get("content-type")?.split(";")[0].trim() ?? undefined,
+        contentLength: buffer.byteLength,
+        base64: buffer.toString("base64"),
+      };
+    } catch (error) {
+      if (error instanceof HomeboxMcpError) throw error;
+      if ((error as Error).name === "AbortError") throw new HomeboxMcpError("network", `Public URL fetch timed out after ${this.timeoutMs}ms`);
+      throw new HomeboxMcpError("network", `Public URL fetch failed: ${(error as Error).message}`);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   async deleteAttachment(token: string, itemId: string, attachmentId: string): Promise<unknown> {
     return this.deleteEntityAttachment(token, itemId, attachmentId);
   }
@@ -467,6 +520,10 @@ export class HomeboxClient {
 
   async listTags(token: string): Promise<unknown> {
     return this.request("GET", "/api/v1/tags", { token });
+  }
+
+  async createTag(token: string, name: string): Promise<unknown> {
+    return this.request("POST", "/api/v1/tags", { token, body: { name } });
   }
 
   async listCustomFields(token: string): Promise<unknown> {
@@ -585,6 +642,21 @@ export function authHeader(token: string): string {
   return trimmed.startsWith("Bearer ") ? trimmed : `Bearer ${trimmed}`;
 }
 
+export function publicHttpUrl(raw: string): URL {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch (error) {
+    throw new HomeboxMcpError("validation", `Invalid public URL: ${(error as Error).message}`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new HomeboxMcpError("validation", "Public URL must use http or https");
+  if (url.username || url.password) throw new HomeboxMcpError("validation", "Public URL must not include credentials");
+  const host = url.hostname.toLowerCase();
+  if (host === "localhost" || host.endsWith(".localhost")) throw new HomeboxMcpError("validation", "Public URL must not target localhost");
+  if (isPrivateIpv4(host) || isPrivateIpv6(host)) throw new HomeboxMcpError("validation", "Public URL must not target private or loopback addresses");
+  return url;
+}
+
 export function mergeItemForPut(current: JsonObject, patch: JsonObject): JsonObject {
   const merged: JsonObject = { ...current };
   for (const [key, value] of Object.entries(patch)) {
@@ -631,6 +703,29 @@ function normalizeTokenResponse(response: LoginResponse, operation: string): Log
   const token = response.token ?? response.raw;
   if (!token) throw new HomeboxMcpError("auth", `Homebox ${operation} response did not include a token`);
   return { ...response, token };
+}
+
+function fileNameFromUrl(url: URL): string | undefined {
+  const name = decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() ?? "").trim();
+  return name || undefined;
+}
+
+function safeFileName(value: string): string {
+  return value.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").trim() || "photo";
+}
+
+function isPrivateIpv4(host: string): boolean {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!match) return false;
+  const parts = match.slice(1).map(Number);
+  if (parts.some((part) => part < 0 || part > 255)) return true;
+  const [a, b] = parts;
+  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+}
+
+function isPrivateIpv6(host: string): boolean {
+  const normalized = host.replace(/^\[|\]$/g, "").toLowerCase();
+  return normalized === "::1" || normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("fe80:");
 }
 
 export function translateBodyForItems(body: JsonObject): JsonObject {
