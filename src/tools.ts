@@ -1162,8 +1162,8 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     {
       title: "Bulk Upsert Items",
       description: [
-        "Create/update many purchase/import items in one call. Dedupe defaults to External Asset ID, Order ID, then name. Resolves location/tags, stores external refs as custom fields, uploads public photo URLs, and returns a report.",
-        "Each item accepts name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. Local photo paths are not supported.",
+        "Create/update many purchase/import items in one call. Dedupe defaults to External Asset ID, Order ID, then name. Resolves location/tags, stores external refs as custom fields, uploads direct image file URLs as photos, and returns a report.",
+        "Each item accepts name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. photoUrl must be a direct image file URL (image/jpeg, image/png or image/webp) — do NOT pass product page URLs; store those in sourceUrls instead. Local photo paths are not supported.",
         itemUiApiMapping,
         legacyV025Notes,
       ].join("\n\n"),
@@ -1189,7 +1189,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
       title: "Import Items Bulk",
       description: [
         "Import many purchase items in one call, optimized for sources such as AliExpress orders. Alias for homebox_upsert_items_bulk; prefer this over manual orchestration.",
-        "Each item accepts name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. Local photo paths are not supported.",
+        "Each item accepts name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. photoUrl must be a direct image file URL (image/jpeg, image/png or image/webp) — do NOT pass product page URLs; store those in sourceUrls instead. Local photo paths are not supported.",
         itemUiApiMapping,
         legacyV025Notes,
       ].join("\n\n"),
