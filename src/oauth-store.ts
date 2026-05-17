@@ -1,4 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 import type { HomeboxSession } from "./session-store.js";
 
@@ -6,6 +8,7 @@ export interface OAuthStoreOptions {
   authCodeTtlSeconds: number;
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
+  storagePath?: string;
 }
 
 export interface RegisteredOAuthClient {
@@ -47,6 +50,19 @@ interface AccessTokenRecord {
   expiresAt: number;
 }
 
+interface StoredMapEntry<T> {
+  key: string;
+  value: T;
+}
+
+interface PersistedOAuthStore {
+  version: 1;
+  clients: RegisteredOAuthClient[];
+  authorizationCodes: Array<StoredMapEntry<AuthorizationCode>>;
+  accessTokens: Array<StoredMapEntry<AccessTokenRecord>>;
+  refreshTokens: Array<StoredMapEntry<RefreshTokenRecord>>;
+}
+
 export interface RefreshTokenRecord {
   clientId: string;
   resource: string;
@@ -71,7 +87,9 @@ export class OAuthStore {
   private readonly accessTokens = new Map<string, AccessTokenRecord>();
   private readonly refreshTokens = new Map<string, RefreshTokenRecord>();
 
-  constructor(private readonly options: OAuthStoreOptions) {}
+  constructor(private readonly options: OAuthStoreOptions) {
+    this.loadPersisted();
+  }
 
   registerClient(input: unknown): RegisteredOAuthClient {
     const data = objectInput(input);
@@ -95,6 +113,7 @@ export class OAuthStore {
       client_name: stringValue(data.client_name),
     };
     this.clients.set(client.client_id, client);
+    this.persist();
     return client;
   }
 
@@ -130,6 +149,7 @@ export class OAuthStore {
       ...input,
       expiresAt: Date.now() + this.options.authCodeTtlSeconds * 1000,
     });
+    this.persist();
     return code;
   }
 
@@ -141,8 +161,10 @@ export class OAuthStore {
     resource?: string;
   }): AuthorizationCodeInput {
     const code = required(input.code, "code");
-    const stored = this.authorizationCodes.get(hashSecret(code));
-    this.authorizationCodes.delete(hashSecret(code));
+    const codeKey = hashSecret(code);
+    const stored = this.authorizationCodes.get(codeKey);
+    this.authorizationCodes.delete(codeKey);
+    this.persist();
     if (!stored) throw new OAuthError("invalid_grant", "Unknown authorization code");
     if (stored.expiresAt < Date.now()) throw new OAuthError("invalid_grant", "Authorization code expired");
     if (stored.clientId !== required(input.clientId, "client_id")) throw new OAuthError("invalid_grant", "client_id mismatch");
@@ -166,6 +188,7 @@ export class OAuthStore {
       ...input,
       expiresAt: now + this.options.refreshTokenTtlSeconds * 1000,
     });
+    this.persist();
     return { accessToken, refreshToken, expiresIn: this.options.accessTokenTtlSeconds, scope: input.scope };
   }
 
@@ -175,6 +198,7 @@ export class OAuthStore {
     if (!record) return undefined;
     if (record.expiresAt < Date.now()) {
       this.accessTokens.delete(key);
+      this.persist();
       return undefined;
     }
     if (!safeEqual(record.resource, expectedResource)) return undefined;
@@ -188,16 +212,75 @@ export class OAuthStore {
     if (!record) throw new OAuthError("invalid_grant", "Unknown refresh token");
     if (record.expiresAt < Date.now()) {
       this.refreshTokens.delete(key);
+      this.persist();
       throw new OAuthError("invalid_grant", "Refresh token expired");
     }
     if (record.clientId !== required(input.clientId, "client_id")) throw new OAuthError("invalid_grant", "client_id mismatch");
     if (input.resource && record.resource !== input.resource) throw new OAuthError("invalid_target", "resource mismatch");
+    this.refreshTokens.delete(key);
+    this.persist();
     return record;
   }
 
   revokeRefreshToken(refreshToken: string | undefined): void {
-    if (refreshToken) this.refreshTokens.delete(hashSecret(refreshToken));
+    if (!refreshToken) return;
+    this.refreshTokens.delete(hashSecret(refreshToken));
+    this.persist();
   }
+
+  private loadPersisted(): void {
+    const storagePath = this.options.storagePath;
+    if (!storagePath || !existsSync(storagePath)) return;
+
+    const raw = JSON.parse(readFileSync(storagePath, "utf8")) as PersistedOAuthStore;
+    if (!raw || raw.version !== 1) throw new OAuthError("server_error", "Invalid OAuth store file", 500);
+
+    for (const client of arrayInput(raw.clients)) this.clients.set(client.client_id, client);
+    const now = Date.now();
+    const prunedCodes = loadUnexpired(this.authorizationCodes, raw.authorizationCodes, now);
+    const prunedAccess = loadUnexpired(this.accessTokens, raw.accessTokens, now);
+    const prunedRefresh = loadUnexpired(this.refreshTokens, raw.refreshTokens, now);
+    const pruned = prunedCodes || prunedAccess || prunedRefresh;
+    if (pruned) this.persist();
+  }
+
+  private persist(): void {
+    const storagePath = this.options.storagePath;
+    if (!storagePath) return;
+
+    mkdirSync(dirname(storagePath), { recursive: true, mode: 0o700 });
+    const tmpPath = `${storagePath}.${process.pid}.tmp`;
+    const data: PersistedOAuthStore = {
+      version: 1,
+      clients: [...this.clients.values()],
+      authorizationCodes: mapEntries(this.authorizationCodes),
+      accessTokens: mapEntries(this.accessTokens),
+      refreshTokens: mapEntries(this.refreshTokens),
+    };
+    writeFileSync(tmpPath, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmpPath, storagePath);
+    try { chmodSync(storagePath, 0o600); } catch { /* Best effort on non-POSIX filesystems. */ }
+  }
+}
+
+function mapEntries<T>(map: Map<string, T>): Array<StoredMapEntry<T>> {
+  return [...map.entries()].map(([key, value]) => ({ key, value }));
+}
+
+function arrayInput<T>(value: T[] | undefined): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function loadUnexpired<T extends { expiresAt: number }>(target: Map<string, T>, entries: Array<StoredMapEntry<T>> | undefined, now: number): boolean {
+  let pruned = false;
+  for (const entry of arrayInput(entries)) {
+    if (entry.value.expiresAt < now) {
+      pruned = true;
+      continue;
+    }
+    target.set(entry.key, entry.value);
+  }
+  return pruned;
 }
 
 function objectInput(value: unknown): Record<string, unknown> {

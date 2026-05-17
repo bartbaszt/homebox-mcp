@@ -33,11 +33,13 @@ $env:HOMEBOX_BASE_URL = "https://homebox.example.com"
 $env:HOMEBOX_MCP_API_TOKEN = "long-random-token" # or enable OAuth below
 ```
 
-Default endpoint:
+Default local endpoint:
 
 ```text
-http://0.0.0.0:3000/mcp
+http://127.0.0.1:3000/mcp
 ```
+
+The Node default listener is `127.0.0.1`. Docker sets `HOMEBOX_MCP_HOST=0.0.0.0`, and startup fails unless `HOMEBOX_MCP_API_TOKEN` is set or OAuth is enabled. Placeholder API tokens such as `change-me` are rejected.
 
 External agents should connect to the public address and send:
 
@@ -88,6 +90,7 @@ For ChatGPT Apps/Connectors, enable OAuth instead of asking the model to call `h
 $env:HOMEBOX_MCP_OAUTH_ENABLED = "true"
 $env:HOMEBOX_MCP_PUBLIC_URL = "https://mcp.example.com/mcp"
 $env:HOMEBOX_MCP_TRUST_PROXY = "true" # when behind reverse proxy/tunnel
+$env:HOMEBOX_MCP_DATA_DIR = "C:\homebox-mcp-data" # persist OAuth clients/tokens across restarts
 npm start
 ```
 
@@ -108,10 +111,13 @@ Optional OAuth env:
 - `HOMEBOX_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS`: access token lifetime, default `3600`.
 - `HOMEBOX_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS`: refresh token lifetime, default `2592000`.
 - `HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP`: local/test escape hatch; do not use in production.
+- `HOMEBOX_MCP_DATA_DIR`: optional writable directory for `oauth-store.json`. Set this for ChatGPT connectors so OAuth client registrations and tokens survive restarts.
 
 ChatGPT connects to the public `/mcp` URL. On first auth, the browser form logs into Homebox once, the password is discarded, and ChatGPT stores the OAuth token pair in connector settings. Tool calls can then omit `sessionKey` and raw Homebox tokens.
 
-OAuth tokens and mapped Homebox sessions are in-memory. Restarting this server invalidates existing connector tokens and requires reconnecting.
+When using MCP OAuth, tool inputs `sessionKey` and raw `token` are rejected so one OAuth connector cannot use another user's in-memory session.
+
+OAuth client registrations, tokens and mapped Homebox sessions are in-memory unless `HOMEBOX_MCP_DATA_DIR` is set. Docker deployments should mount a private writable `/data` volume and set `HOMEBOX_MCP_DATA_DIR=/data` so restarts do not require reconnecting ChatGPT connectors.
 
 ## HTTPS
 
@@ -143,7 +149,7 @@ With static MCP auth or local agents:
 
 ## Tools
 
-- Auth: `homebox_login`, `homebox_register_token`, `homebox_refresh_session`, `homebox_logout`, `homebox_list_sessions`.
+- Auth: `homebox_login`, `homebox_register_token`, `homebox_refresh_session`, `homebox_logout`.
 - Instance: `homebox_status`, `homebox_list_currencies`, `homebox_api_request`.
 - Collections: `homebox_list_collections`.
 - Items: `homebox_list_items`, `homebox_get_item`, `homebox_create_item`, `homebox_update_item`, `homebox_put_item`, `homebox_patch_item`, `homebox_delete_item`.

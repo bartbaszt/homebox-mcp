@@ -1,24 +1,41 @@
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { type AppConfig } from "../../src/config.js";
+import { loadConfig, type AppConfig } from "../../src/config.js";
+import { OAuthStore } from "../../src/oauth-store.js";
 import { startServer, type StartedServer } from "../../src/server.js";
 import { json, startMockHomebox, type MockHomeboxServer } from "../support/mock-homebox.js";
 
 let mock: MockHomeboxServer | undefined;
 let started: StartedServer | undefined;
+let tempDir: string | undefined;
 
 afterEach(async () => {
   await started?.close();
   await mock?.close();
   started = undefined;
   mock = undefined;
+  if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+  tempDir = undefined;
 });
 
 describe("HTTP MCP server", () => {
+  it("refuses unsafe unauthenticated public listener config", () => {
+    expect(() => loadConfig({ HOMEBOX_BASE_URL: "http://homebox.local", HOMEBOX_MCP_HOST: "0.0.0.0" })).toThrow(/Refusing to listen/);
+    expect(() => loadConfig({ HOMEBOX_BASE_URL: "http://homebox.local", HOMEBOX_MCP_API_TOKEN: "change-me" })).toThrow(/placeholder/);
+    expect(loadConfig({ HOMEBOX_BASE_URL: "http://homebox.local" }).host).toBe("127.0.0.1");
+  });
+
+  it("refuses unsafe direct runtime config", async () => {
+    await expect(startServer({ ...testConfig("http://127.0.0.1:1"), host: "0.0.0.0" })).rejects.toThrow(/Refusing to listen/);
+  });
+
   it("requires MCP API token when configured", async () => {
     mock = await startMockHomebox((_req, res) => json(res, 200, { ok: true }));
     started = await startServer(testConfig(mock.url, "mcp-secret"));
@@ -189,6 +206,102 @@ describe("HTTP MCP server", () => {
     expect(tokens.token_type).toBe("Bearer");
 
     const client = new Client({ name: "homebox-mcp-oauth-test", version: "0.1.0" });
+    const transport = new StreamableHTTPClientTransport(new URL(started.url), {
+      requestInit: { headers: { Authorization: `Bearer ${tokens.access_token}` } },
+    });
+    await client.connect(transport);
+
+    const items = await client.callTool({ name: "homebox_list_items", arguments: { pageSize: 1 } });
+    expect(items.structuredContent).toMatchObject({ total: 1 });
+
+    const rejectedSessionOverride = await client.callTool({ name: "homebox_list_items", arguments: { sessionKey: "other-session", pageSize: 1 } });
+    expect(rejectedSessionOverride.isError).toBe(true);
+    expect(rejectedSessionOverride.structuredContent).toMatchObject({ kind: "auth" });
+
+    await client.close();
+  });
+
+  it("consumes OAuth refresh tokens atomically", () => {
+    const store = new OAuthStore({ authCodeTtlSeconds: 300, accessTokenTtlSeconds: 3600, refreshTokenTtlSeconds: 3600 });
+    const tokens = store.issueTokens({
+      clientId: "client-1",
+      resource: "https://mcp.example.com/mcp",
+      session: { sessionKey: "oauth:client-1", token: "Bearer homebox-token", createdAt: new Date().toISOString() },
+    });
+
+    expect(store.consumeRefreshToken({ clientId: "client-1", refreshToken: tokens.refreshToken }).clientId).toBe("client-1");
+    expect(() => store.consumeRefreshToken({ clientId: "client-1", refreshToken: tokens.refreshToken })).toThrow(/Unknown refresh token/);
+  });
+
+  it("persists OAuth clients and tokens across restarts", async () => {
+    mock = await startMockHomebox((req, res) => {
+      if (req.method === "POST" && req.path === "/api/v1/users/login") {
+        json(res, 200, { token: "Bearer persisted-homebox-token", expiresAt: "2030-01-01T00:00:00Z" });
+        return;
+      }
+      if (req.method === "GET" && req.path === "/api/v1/entities") {
+        json(res, 404, { error: "not found" });
+        return;
+      }
+      if (req.method === "GET" && req.path === "/api/v1/items") {
+        expect(req.headers.authorization).toBe("Bearer persisted-homebox-token");
+        json(res, 200, { page: 1, pageSize: 1, total: 1, items: [{ id: "item-persisted", name: "Persisted OAuth Drill" }] });
+        return;
+      }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+    tempDir = mkdtempSync(join(tmpdir(), "homebox-mcp-oauth-"));
+    const config = oauthTestConfig(mock.url);
+    config.dataDir = tempDir;
+    config.oauth = { ...config.oauth!, publicUrl: "http://homebox-mcp.test/mcp" };
+    started = await startServer(config);
+    const origin = new URL(started.url).origin;
+    const redirectUri = "http://127.0.0.1/callback";
+    const resource = config.oauth.publicUrl;
+
+    const registration = await fetch(`${origin}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name: "ChatGPT persisted test", redirect_uris: [redirectUri], token_endpoint_auth_method: "none" }),
+    });
+    const registered = (await registration.json()) as { client_id: string };
+    const verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012345678901234567890123456789";
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
+
+    const authorize = await fetch(`${origin}/oauth/authorize`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        response_type: "code",
+        client_id: registered.client_id,
+        redirect_uri: redirectUri,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        resource,
+        username: "user@example.com",
+        password: "secret",
+      }),
+    });
+    const callback = new URL(authorize.headers.get("location") ?? "");
+
+    const tokenResponse = await fetch(`${origin}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: registered.client_id,
+        redirect_uri: redirectUri,
+        code: callback.searchParams.get("code") ?? "",
+        code_verifier: verifier,
+        resource,
+      }),
+    });
+    const tokens = (await tokenResponse.json()) as { access_token: string };
+
+    await started.close();
+    started = await startServer(config);
+    const client = new Client({ name: "homebox-mcp-persisted-oauth-test", version: "0.1.0" });
     const transport = new StreamableHTTPClientTransport(new URL(started.url), {
       requestInit: { headers: { Authorization: `Bearer ${tokens.access_token}` } },
     });

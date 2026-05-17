@@ -15,8 +15,8 @@ export interface ToolState {
 }
 
 const authInput = {
-  sessionKey: z.string().min(1).optional().describe("Optional session key returned by homebox_login or homebox_register_token. Not needed when MCP OAuth is connected."),
-  token: z.string().min(1).optional().describe("Optional raw Homebox token. Prefer MCP OAuth or sessionKey so tokens stay out of prompts."),
+  sessionKey: z.string().min(1).optional().describe("Optional session key returned by homebox_login or homebox_register_token. Rejected when MCP OAuth is connected."),
+  token: z.string().min(1).optional().describe("Optional raw Homebox token. Rejected when MCP OAuth is connected. Prefer MCP OAuth or sessionKey so tokens stay out of prompts."),
 };
 
 const itemId = z.string().min(1).describe("Homebox item ID.");
@@ -264,16 +264,15 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
         username: z.string().min(1).describe("Homebox username or email."),
         password: z.string().min(1).describe("Homebox password. Never stored."),
         stayLoggedIn: z.boolean().optional().default(true),
-        sessionKey: z.string().min(1).optional().describe("Optional caller-chosen session key to overwrite or create."),
       },
       outputSchema: publicSessionOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    ({ username, password, stayLoggedIn, sessionKey }) =>
+    ({ username, password, stayLoggedIn }) =>
       toolResult(async () => {
+        ensureSessionToolsAllowed(state);
         const login = await state.homebox.login(username, password, stayLoggedIn ?? true);
         return state.sessions.set({
-          sessionKey,
           token: login.token,
           username,
           expiresAt: login.expiresAt,
@@ -291,13 +290,15 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
         token: z.string().min(1).describe("Homebox bearer token."),
         username: z.string().min(1).optional(),
         expiresAt: z.string().min(1).optional(),
-        sessionKey: z.string().min(1).optional(),
       },
       outputSchema: publicSessionOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    ({ token, username, expiresAt, sessionKey }) =>
-      toolResult(() => state.sessions.set({ sessionKey, token, username, expiresAt }), "Token registered. Use sessionKey for later tools."),
+    ({ token, username, expiresAt }) =>
+      toolResult(() => {
+        ensureSessionToolsAllowed(state);
+        return state.sessions.set({ token, username, expiresAt });
+      }, "Token registered. Use sessionKey for later tools."),
   );
 
   server.registerTool(
@@ -311,6 +312,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     },
     ({ sessionKey }) =>
       toolResult(async () => {
+        ensureSessionToolsAllowed(state);
         const session = state.sessions.get(sessionKey);
         const refreshed = await state.homebox.refresh(session.token);
         return state.sessions.updateToken(sessionKey, refreshed.token, refreshed.expiresAt, refreshed.attachmentToken);
@@ -326,19 +328,10 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
       outputSchema: logoutOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    ({ sessionKey }) => toolResult(() => ({ removed: state.sessions.delete(sessionKey) }), "Session removed"),
-  );
-
-  server.registerTool(
-    "homebox_list_sessions",
-    {
-      title: "List In-Memory Sessions",
-      description: "List non-secret metadata for sessions currently held by this MCP process.",
-      inputSchema: {},
-      outputSchema: sessionListOutput,
-      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
-    },
-    () => toolResult(() => ({ sessions: state.sessions.list() }), "Sessions loaded"),
+    ({ sessionKey }) => toolResult(() => {
+      ensureSessionToolsAllowed(state);
+      return { removed: state.sessions.delete(sessionKey) };
+    }, "Session removed"),
   );
 
   server.registerTool(
@@ -1323,16 +1316,27 @@ function registerGenericRequestTool(server: McpServer, state: ToolState): void {
 }
 
 function tokenFrom(args: { sessionKey?: string; token?: string }, state: ToolState): string {
+  if (state.connectionSession) {
+    if (args.token || args.sessionKey) throw new HomeboxMcpError("auth", "Do not pass token or sessionKey when using MCP OAuth; the OAuth connection session is used automatically.");
+    return state.connectionSession.token;
+  }
   if (args.token) return args.token;
   if (args.sessionKey) return state.sessions.get(args.sessionKey).token;
-  if (state.connectionSession) return state.connectionSession.token;
   throw new HomeboxMcpError("auth", "Provide sessionKey/token or connect to this MCP server with OAuth.");
 }
 
 function optionalTokenFrom(args: { sessionKey?: string; token?: string }, state: ToolState): string | undefined {
+  if (state.connectionSession) {
+    if (args.token || args.sessionKey) throw new HomeboxMcpError("auth", "Do not pass token or sessionKey when using MCP OAuth; the OAuth connection session is used automatically.");
+    return state.connectionSession.token;
+  }
   if (args.token) return args.token;
   if (args.sessionKey) return state.sessions.get(args.sessionKey).token;
-  return state.connectionSession?.token;
+  return undefined;
+}
+
+function ensureSessionToolsAllowed(state: ToolState): void {
+  if (state.connectionSession) throw new HomeboxMcpError("auth", "Session management tools are disabled for MCP OAuth connections; use the OAuth-authorized Homebox session for tool calls.");
 }
 
 export type DownloadResult = { contentType?: string; contentLength: number; base64: string; text?: string; itemId?: string; attachmentId?: string; entityId?: string };

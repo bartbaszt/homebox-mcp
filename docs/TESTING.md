@@ -20,8 +20,12 @@ Coverage:
 - Workflow helpers for tag resolution, location creation, full item creation, bulk upsert, primary photo replacement and public URL validation.
 - Workflow payload mapping uses `purchaseTime` for purchase date and rejects `purchaseDate` in generated payloads.
 - MCP endpoint API-token enforcement.
+- Fail-closed startup for non-local listeners without MCP auth and rejection of placeholder API tokens.
 - ChatGPT-style OAuth DCR + PKCE connection flow.
 - OAuth-authenticated tool calls without `homebox_login` or `sessionKey`.
+- Rejection of tool-level `sessionKey` override on OAuth-authenticated MCP connections.
+- OAuth client/token persistence across server restarts when `HOMEBOX_MCP_DATA_DIR` is configured.
+- Atomic refresh token consumption to prevent refresh token replay.
 - Tool calls through Streamable HTTP client.
 - Auto-detection of API surface and routing: legacy method names hitting `/entities` when the new API is available, new method names hitting `/items` (with parameter/body translation) when only the legacy API is available.
 

@@ -7,11 +7,12 @@ Create a remote MCP server for one Homebox instance. External agents connect ove
 ## Architecture
 
 1. **HTTP layer**: Express server exposes `/health` and Streamable HTTP MCP at `/mcp`.
-2. **MCP auth**: optional in local dev, mandatory for exposed deployments through `HOMEBOX_MCP_API_TOKEN`.
+2. **MCP auth**: optional on local loopback, fail-closed on non-local listeners unless `HOMEBOX_MCP_API_TOKEN` is set or OAuth is enabled.
 3. **Homebox client**: typed wrapper around `/api/v1` with normalized URL, timeout, auth header handling, and safe error messages.
 4. **Session store**: in-memory map of `sessionKey -> Homebox token metadata`, supporting many users without storing passwords.
-5. **Tools**: named MCP tools for verified operations plus generic `homebox_api_request` for API parity.
-6. **Tests**: mocked integration tests for writes and edge cases; real E2E read-only against test Homebox credentials.
+5. **OAuth persistence**: optional `HOMEBOX_MCP_DATA_DIR` writes OAuth clients/tokens/session mappings to `oauth-store.json` so ChatGPT connectors survive restarts.
+6. **Tools**: named MCP tools for verified operations plus generic `homebox_api_request` for API parity.
+7. **Tests**: mocked integration tests for writes and edge cases; real E2E read-only against test Homebox credentials.
 
 ## Delivery Steps
 
@@ -33,7 +34,10 @@ Create a remote MCP server for one Homebox instance. External agents connect ove
 
 ## Risk Controls
 
-- No persistent token database in starter version.
+- OAuth persistence is opt-in through `HOMEBOX_MCP_DATA_DIR`; the data directory contains Homebox tokens and must stay private.
+- OAuth-authenticated tool calls reject caller-provided `sessionKey` and raw Homebox `token` values to prevent cross-user session use.
+- Public URL downloads validate redirect targets, block private/reserved DNS resolutions, and stream bodies with hard byte limits.
+- Legacy SSE keeps an in-memory sessionId-to-transport registry; Streamable HTTP remains the primary transport.
 - No destructive E2E by default.
 - Generic request is restricted to relative `/api/v1/...` paths.
 - Item full updates are GET-merge-PUT to avoid field loss.

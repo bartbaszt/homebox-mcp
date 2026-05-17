@@ -1,13 +1,14 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
+import { join } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express, { type NextFunction, type Request, type Response } from "express";
 
-import { type AppConfig, type OAuthConfig, loadConfig, loadTlsConfig } from "./config.js";
+import { type AppConfig, type OAuthConfig, loadConfig, loadTlsConfig, validateConfigSecurity } from "./config.js";
 import { HomeboxMcpError } from "./errors.js";
 import { HomeboxClient } from "./homebox-client.js";
 import { OAuthError, OAuthStore } from "./oauth-store.js";
@@ -36,7 +37,7 @@ export function createRuntime(config = loadConfig()): RuntimeState {
     config,
     homebox: new HomeboxClient(config.homeboxBaseUrl, config.timeoutMs, config.maxUploadBytes, config.maxDownloadBytes),
     sessions: new SessionStore(),
-    oauth: new OAuthStore(oauth),
+    oauth: new OAuthStore({ ...oauth, storagePath: config.dataDir ? join(config.dataDir, "oauth-store.json") : undefined }),
   };
 }
 
@@ -71,6 +72,7 @@ export function createHttpApp(state: RuntimeState): express.Express {
       homeboxBaseUrl: state.config.homeboxBaseUrl,
       authRequired: Boolean(state.config.apiToken || oauthConfig(state.config).enabled),
       oauthEnabled: oauthConfig(state.config).enabled,
+      oauthStorage: state.config.dataDir ? "disk" : "memory",
     });
   });
 
@@ -91,11 +93,14 @@ export function createHttpApp(state: RuntimeState): express.Express {
 
   const ssePath = `${state.config.mcpPath}/sse`;
   const sseMessagesPath = `${state.config.mcpPath}/messages`;
+  const sseTransports = new Map<string, { server: McpServer; transport: SSEServerTransport }>();
 
   app.get(ssePath, requireMcpAuth(state), async (_req, res) => {
     const server = createMcpServer(state, authenticatedSession(_req as Request));
     const transport = new SSEServerTransport(sseMessagesPath, res);
+    sseTransports.set(transport.sessionId, { server, transport });
     res.on("close", () => {
+      sseTransports.delete(transport.sessionId);
       void server.close();
     });
     await server.connect(transport);
@@ -108,14 +113,13 @@ export function createHttpApp(state: RuntimeState): express.Express {
         res.status(400).json({ ok: false, error: "Missing sessionId query parameter" });
         return;
       }
-      const server = createMcpServer(state, authenticatedSession(req));
-      const transport = new SSEServerTransport(sseMessagesPath, {} as any);
-      (transport as any).sessionId = sessionId;
-      await server.connect(transport);
+      const entry = sseTransports.get(sessionId);
+      if (!entry) {
+        res.status(404).json({ ok: false, error: "Unknown SSE sessionId" });
+        return;
+      }
+      const { transport } = entry;
       await transport.handlePostMessage(req, res, req.body);
-      res.on("close", () => {
-        void server.close();
-      });
     } catch (error) {
       next(error);
     }
@@ -129,6 +133,7 @@ export function createHttpApp(state: RuntimeState): express.Express {
 }
 
 export async function startServer(config = loadConfig()): Promise<StartedServer> {
+  validateConfigSecurity(config);
   const state = createRuntime(config);
   const app = createHttpApp(state);
   const tls = loadTlsConfig(config);
@@ -305,7 +310,6 @@ function registerOAuthRoutes(app: express.Express, state: RuntimeState): void {
             },
           }),
         );
-        state.oauth.revokeRefreshToken(refreshToken);
         return;
       }
 

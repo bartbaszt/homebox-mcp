@@ -8,6 +8,12 @@
 - `homebox_logout`: remove an in-memory session.
 - MCP OAuth endpoints for ChatGPT connector login: `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `/oauth/register`, `/oauth/authorize`, `/oauth/token`.
 
+When `HOMEBOX_MCP_DATA_DIR` is configured, OAuth dynamic client registrations, authorization codes, access tokens, refresh tokens and mapped Homebox sessions are persisted to `oauth-store.json` in that directory. Raw OAuth token strings are not stored, only their hashes; mapped Homebox sessions still contain Homebox tokens and must be treated as secrets.
+
+OAuth refresh tokens are single-use. `consumeRefreshToken` removes the old refresh token before Homebox token refresh, so concurrent refresh attempts cannot replay the same token.
+
+When an MCP request is authenticated by OAuth, tool-level `sessionKey` and raw Homebox `token` inputs are rejected; the connection's OAuth session is used instead.
+
 ## Instance
 
 - `homebox_status`: `GET /api/v1/status`.

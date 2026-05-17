@@ -33,6 +33,7 @@ services:
       HOMEBOX_MCP_HOST: "0.0.0.0"
       HOMEBOX_MCP_PORT: "3000"
       HOMEBOX_MCP_PATH: "/mcp"
+      HOMEBOX_MCP_DATA_DIR: "/data"
     ports:
       - "3101:3000"
     healthcheck:
@@ -44,10 +45,15 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    volumes:
+      - homebox-mcp-data:/data
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+volumes:
+  homebox-mcp-data:
 ```
 
 Create `.env`:
@@ -59,8 +65,9 @@ HOMEBOX_MCP_PORT=3000
 HOMEBOX_MCP_PATH=/mcp
 HOMEBOX_MCP_PUBLISH_PORT=3101
 
-# Required for externally exposed deployments
-HOMEBOX_MCP_API_TOKEN=change-me-to-a-random-string
+# Required for externally exposed deployments unless OAuth is enabled.
+# Placeholder values such as change-me are rejected at startup.
+HOMEBOX_MCP_API_TOKEN=replace-with-a-long-random-token
 
 # Optional: enable ChatGPT-compatible OAuth
 # HOMEBOX_MCP_OAUTH_ENABLED=true
@@ -71,6 +78,9 @@ HOMEBOX_MCP_API_TOKEN=change-me-to-a-random-string
 # HOMEBOX_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS=2592000
 # HOMEBOX_MCP_OAUTH_AUTH_CODE_TTL_SECONDS=300
 # HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP=false
+
+# Persist OAuth client registrations/tokens across container restarts
+HOMEBOX_MCP_DATA_DIR=/data
 
 HOMEBOX_API_TIMEOUT_MS=30000
 HOMEBOX_MCP_MAX_UPLOAD_BYTES=10485760
@@ -180,6 +190,10 @@ Then call `homebox_login` with Homebox credentials and use the returned `session
 
 OAuth requires HTTPS. Set `HOMEBOX_MCP_PUBLIC_URL` to the exact public MCP endpoint URL including the `/mcp` path — the token is bound to this `resource` value.
 
+Set `HOMEBOX_MCP_DATA_DIR=/data` and mount a private writable volume at `/data` so OAuth dynamic client registrations, access tokens, refresh tokens and mapped Homebox sessions survive container restarts. The persisted file is `oauth-store.json` and contains Homebox tokens; do not share or commit it.
+
+When OAuth authenticates an MCP connection, tool-level `sessionKey` and raw `token` inputs are rejected. The OAuth-authorized Homebox session is always used for that connection.
+
 Endpoints exposed when OAuth is enabled:
 
 - `GET /.well-known/oauth-protected-resource` — resource metadata
@@ -231,6 +245,7 @@ GitHub Actions (`.github/workflows/docker.yml`) builds and pushes the image to `
 
 - Never commit `.env`, tokens, certificates, or `.test-access`.
 - For any publicly exposed MCP server, require `HOMEBOX_MCP_API_TOKEN` or enable OAuth.
-- OAuth tokens and Homebox session mappings are in-memory only; restarting the container invalidates all active sessions and requires reconnecting.
+- The server refuses to listen on non-local hosts without `HOMEBOX_MCP_API_TOKEN` or OAuth enabled, and rejects placeholder API tokens such as `change-me`.
+- OAuth tokens and Homebox session mappings are persisted only when `HOMEBOX_MCP_DATA_DIR` is set. The data directory contains secrets and must not be committed or exposed.
 - The `/health` endpoint does not expose secrets but shows basic configuration status.
 - Always use HTTPS (reverse proxy or tunnel) when exposing the service publicly.

@@ -4,7 +4,7 @@ startServer()
   .then(({ state, url }) => {
     const protocol = state.config.tlsKeyPath ? "HTTPS" : "HTTP";
     console.error(`Homebox MCP listening over ${protocol} at ${url}`);
-    if (!state.config.apiToken) {
+    if (!state.config.apiToken && !state.config.oauth?.enabled) {
       console.error("WARNING: HOMEBOX_MCP_API_TOKEN is not set. Do not expose this server externally without it.");
     }
   })

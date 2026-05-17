@@ -6,6 +6,8 @@ This guide is for MCP clients and agents using Homebox MCP. Homebox MCP is an un
 
 For ChatGPT-compatible OAuth connectors, connect to the public `/mcp` URL and complete the Homebox login form once. Later tool calls can omit `sessionKey`.
 
+Server operators should set `HOMEBOX_MCP_DATA_DIR` to persist OAuth client registrations and tokens. Without it, restarting Homebox MCP invalidates existing ChatGPT connector tokens and requires reconnecting.
+
 For static MCP auth or local clients:
 
 1. Call `homebox_status` to verify the target Homebox instance.
@@ -14,6 +16,8 @@ For static MCP auth or local clients:
 4. Call `homebox_logout` when done.
 
 Raw Homebox tokens are accepted by most tools through `token`, but `sessionKey` or OAuth is preferred so tokens stay out of prompts.
+
+When connected through MCP OAuth, do not pass `sessionKey` or raw `token`; those inputs are rejected and the OAuth-authorized Homebox session is used automatically.
 
 ## Choose Item Or Entity Tools
 

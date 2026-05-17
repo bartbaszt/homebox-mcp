@@ -16,10 +16,11 @@ FROM base AS runtime
 ENV NODE_ENV=production \
     HOMEBOX_MCP_HOST=0.0.0.0 \
     HOMEBOX_MCP_PORT=3000 \
-    HOMEBOX_MCP_PATH=/mcp
+    HOMEBOX_MCP_PATH=/mcp \
+    HOMEBOX_MCP_DATA_DIR=/data
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN mkdir -p /data && chown node:node /data && npm ci --omit=dev && npm cache clean --force
 
 COPY --from=build /app/dist ./dist
 

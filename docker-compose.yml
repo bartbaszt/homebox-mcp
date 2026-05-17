@@ -14,6 +14,7 @@ services:
       HOMEBOX_MCP_HOST: 0.0.0.0
       HOMEBOX_MCP_PORT: ${HOMEBOX_MCP_PORT:-3000}
       HOMEBOX_MCP_PATH: ${HOMEBOX_MCP_PATH:-/mcp}
+      HOMEBOX_MCP_DATA_DIR: ${HOMEBOX_MCP_DATA_DIR:-/data}
     ports:
       - "${HOMEBOX_MCP_PUBLISH_PORT:-3000}:${HOMEBOX_MCP_PORT:-3000}"
     healthcheck:
@@ -27,7 +28,12 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    volumes:
+      - homebox-mcp-data:/data
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+volumes:
+  homebox-mcp-data:

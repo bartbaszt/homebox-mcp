@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { isIP } from "node:net";
 
 import { HomeboxMcpError } from "./errors.js";
 
@@ -12,6 +13,7 @@ export interface AppConfig {
   oauth?: OAuthConfig;
   tlsKeyPath?: string;
   tlsCertPath?: string;
+  dataDir?: string;
   timeoutMs: number;
   maxUploadBytes: number;
   maxDownloadBytes: number;
@@ -90,20 +92,45 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new HomeboxMcpError("config", "HOMEBOX_MCP_PUBLIC_URL must use HTTPS when OAuth is enabled");
   }
 
-  return {
+  const apiToken = env.HOMEBOX_MCP_API_TOKEN?.trim() || undefined;
+  const host = env.HOMEBOX_MCP_HOST?.trim() || "127.0.0.1";
+  const config: AppConfig = {
     homeboxBaseUrl,
-    host: env.HOMEBOX_MCP_HOST?.trim() || "0.0.0.0",
+    host,
     port: readInt(env, "HOMEBOX_MCP_PORT", 3000),
     mcpPath,
-    apiToken: env.HOMEBOX_MCP_API_TOKEN?.trim() || undefined,
+    apiToken,
     trustProxy: readBool(env, "HOMEBOX_MCP_TRUST_PROXY"),
     oauth,
     tlsKeyPath: env.HOMEBOX_MCP_TLS_KEY?.trim() || undefined,
     tlsCertPath: env.HOMEBOX_MCP_TLS_CERT?.trim() || undefined,
+    dataDir: env.HOMEBOX_MCP_DATA_DIR?.trim() || undefined,
     timeoutMs: readInt(env, "HOMEBOX_API_TIMEOUT_MS", 30_000),
     maxUploadBytes: readInt(env, "HOMEBOX_MCP_MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
     maxDownloadBytes: readInt(env, "HOMEBOX_MCP_MAX_DOWNLOAD_BYTES", 10 * 1024 * 1024),
   };
+  validateConfigSecurity(config);
+  return config;
+}
+
+export function validateConfigSecurity(config: AppConfig): void {
+  if (config.apiToken && isPlaceholderToken(config.apiToken)) {
+    throw new HomeboxMcpError("config", "HOMEBOX_MCP_API_TOKEN must be changed from the example placeholder value");
+  }
+  if (!config.apiToken && !config.oauth?.enabled && !isLocalListenHost(config.host)) {
+    throw new HomeboxMcpError("config", "Refusing to listen on a non-local host without HOMEBOX_MCP_API_TOKEN or HOMEBOX_MCP_OAUTH_ENABLED=true");
+  }
+}
+
+function isPlaceholderToken(value: string): boolean {
+  return ["change-me", "change-me-to-a-random-string", "changeme", "default", "password"].includes(value.trim().toLowerCase());
+}
+
+export function isLocalListenHost(host: string): boolean {
+  const normalized = host.toLowerCase().replace(/^\[|\]$/g, "");
+  if (["localhost", "127.0.0.1", "::1"].includes(normalized)) return true;
+  if (normalized === "0.0.0.0" || normalized === "::" || normalized === "") return false;
+  return isIP(normalized) === 4 && normalized.startsWith("127.");
 }
 
 export function loadTlsConfig(config: AppConfig): TlsConfig | undefined {
