@@ -33,7 +33,7 @@ const entityTypeId = z.string().min(1).describe("Homebox entity type ID.");
 const templateId = z.string().min(1).describe("Homebox entity template ID.");
 const attachmentId = z.string().min(1).describe("Homebox attachment ID.");
 const locationId = z.string().min(1).describe("Homebox location ID.");
-const jsonObject = z.record(z.unknown());
+const jsonObject = z.record(z.string(), z.unknown());
 const queryValue = z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(z.union([z.string(), z.number(), z.boolean()]))]);
 const base64FileInput = {
   fileName: z.string().min(1),
@@ -165,7 +165,7 @@ const itemWorkflowInput = {
   locationName: z.string().min(1).optional().describe("Location name or path like Garage/Shelf. Created when createMissingLocation is true."),
   createMissingTags: z.boolean().optional().default(false),
   createMissingLocation: z.boolean().optional().default(true),
-  customFields: z.record(workflowFieldValue).optional(),
+  customFields: z.record(z.string(), workflowFieldValue).optional(),
   body: jsonObject.optional().describe("Additional Homebox payload merged before workflow fields."),
   photoUrl: z.string().url().optional().describe("Direct image file URL only. Must return image/jpeg, image/png or image/webp. Do NOT pass product page URLs (Amazon /dp/..., AliExpress /item/...) — store those in sourceUrls instead. Local file paths are not supported."),
   photoFileName: z.string().min(1).optional(),
@@ -364,7 +364,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
         page: z.number().int().positive().optional(),
         pageSize: z.number().int().positive().max(500).optional(),
         collectionId: z.string().min(1).optional().describe("Homebox group ID. Sent as groupId query parameter."),
-        query: z.record(queryValue).optional().describe("Additional Homebox query parameters."),
+        query: z.record(z.string(), queryValue).optional().describe("Additional Homebox query parameters."),
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
@@ -576,7 +576,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
         pageSize: z.number().int().positive().max(500).optional(),
         tags: z.array(z.string().min(1)).optional().describe("Tag IDs."),
         parentIds: z.array(z.string().min(1)).optional().describe("Parent entity IDs."),
-        query: z.record(queryValue).optional().describe("Additional Homebox query parameters."),
+        query: z.record(z.string(), queryValue).optional().describe("Additional Homebox query parameters."),
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
@@ -1310,7 +1310,7 @@ function registerGenericRequestTool(server: McpServer, state: ToolState): void {
         ...authInput,
         method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).default("GET"),
         path: z.string().min(1).describe("Relative path. Must start with /api/v1/. Absolute URLs are rejected."),
-        query: z.record(queryValue).optional(),
+        query: z.record(z.string(), queryValue).optional(),
         body: z.unknown().optional(),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
