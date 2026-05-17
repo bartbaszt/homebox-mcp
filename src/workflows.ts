@@ -440,9 +440,16 @@ function externalFieldName(keyName: DedupeKey): string {
   return "Name";
 }
 
+const IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp", "image/tiff"]);
+
 function assertImage(file: PublicUrlFile): void {
-  if (file.contentType && !file.contentType.toLowerCase().startsWith("image/")) {
-    throw new HomeboxMcpError("validation", `Primary photo must be image/*, got ${file.contentType}`);
+  const ct = file.contentType?.toLowerCase().split(";")[0].trim();
+  if (!ct) return;
+  if (ct === "text/html" || ct === "application/xhtml+xml") {
+    throw new HomeboxMcpError("validation", `photoUrl is not a direct image URL; got ${ct}. The URL must point to an image file (image/jpeg, image/png, image/webp), not a product page. Store product page URLs in sourceUrls/notes instead.`);
+  }
+  if (!IMAGE_CONTENT_TYPES.has(ct) && !ct.startsWith("image/")) {
+    throw new HomeboxMcpError("validation", `photoUrl returned unsupported Content-Type ${ct}. Must be image/jpeg, image/png or image/webp.`);
   }
 }
 

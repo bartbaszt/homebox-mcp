@@ -444,6 +444,11 @@ export class HomeboxClient {
         const response = await requestPublicUrl(current, controller.signal);
         if (![301, 302, 303, 307, 308].includes(response.statusCode ?? 0)) {
           if ((response.statusCode ?? 0) < 200 || (response.statusCode ?? 0) >= 300) throw new HomeboxMcpError("network", `Public URL fetch failed (${response.statusCode})`);
+          const responseContentType = headerValue(response.headers["content-type"])?.split(";")[0].trim().toLowerCase();
+          if (responseContentType === "text/html" || responseContentType === "application/xhtml+xml") {
+            response.resume();
+            throw new HomeboxMcpError("validation", `photoUrl is not a direct image URL; got ${responseContentType}. The URL must point to an image file (image/jpeg, image/png, image/webp), not a product page. Store product page URLs in sourceUrls/notes instead.`);
+          }
           const contentLengthHeader = headerValue(response.headers["content-length"]);
           const advertisedLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : undefined;
           if (advertisedLength && advertisedLength > this.maxUploadBytes) {

@@ -159,7 +159,7 @@ const itemWorkflowInput = {
   createMissingLocation: z.boolean().optional().default(true),
   customFields: z.record(workflowFieldValue).optional(),
   body: jsonObject.optional().describe("Additional Homebox payload merged before workflow fields."),
-  photoUrl: z.string().url().optional().describe("Preferred public image URL for primary photo. Local file paths are not supported."),
+  photoUrl: z.string().url().optional().describe("Direct image file URL only. Must return image/jpeg, image/png or image/webp. Do NOT pass product page URLs (Amazon /dp/..., AliExpress /item/...) — store those in sourceUrls instead. Local file paths are not supported."),
   photoFileName: z.string().min(1).optional(),
   photoContentType: z.string().min(1).optional(),
   photoIsPrimary: z.boolean().optional().default(true),
@@ -1034,7 +1034,7 @@ function registerAttachmentTools(server: McpServer, state: ToolState): void {
 }
 
 function registerWorkflowTools(server: McpServer, state: ToolState): void {
-  const imageUrl = z.string().url().optional().describe("Preferred public image URL. Local file paths are not supported.");
+  const imageUrl = z.string().url().optional().describe("Direct image file URL only. Must return image/jpeg, image/png or image/webp. Do NOT pass product page URLs (Amazon /dp/..., AliExpress /item/...) — store those in sourceUrls/notes instead. Local file paths are not supported.");
 
   server.registerTool(
     "homebox_resolve_tags",
@@ -1096,7 +1096,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
       title: "Create Item Full",
       description: [
         "Workflow create: resolves tags/location, stores external refs as custom fields, creates item, then optionally uploads a primary photo from a public URL.",
-        "Accepted item fields include name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. Local photo paths are not supported.",
+        "Accepted item fields include name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. photoUrl must be a direct image file URL (image/jpeg, image/png or image/webp) — do NOT pass product page URLs; store those in sourceUrls instead. Local photo paths are not supported.",
         itemUiApiMapping,
         legacyV025Notes,
         purchaseImportWorkflow,
@@ -1112,12 +1112,12 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_upload_primary_photo_from_file",
     {
       title: "Upload Primary Photo",
-      description: "Upload and set a primary item photo. Prefer imageUrl/photoUrl public URLs; base64 is fallback. Local file paths are not supported. Use full-size product photo, not an externally generated thumbnail, unless the user explicitly wants the small image.",
+      description: "Upload and set a primary item photo from a direct image file URL or base64. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... URLs — those belong in sourceUrls/notes, not as photoUrl. Local file paths are not supported. Use full-size product photo, not an externally generated thumbnail, unless the user explicitly wants the small image.",
       inputSchema: {
         ...authInput,
         itemId,
         imageUrl,
-        photoUrl: imageUrl.describe("Alias for imageUrl."),
+        photoUrl: imageUrl.describe("Alias for imageUrl. Must be a direct image file URL, not a product page."),
         fileName: z.string().min(1).optional(),
         base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
         contentType: z.string().min(1).optional(),
@@ -1136,12 +1136,12 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_replace_primary_photo",
     {
       title: "Replace Primary Photo",
-      description: "Upload a new primary item photo from public URL/base64. Existing primary attachments are only deleted when deletePreviousPrimary=true. Local file paths are not supported; use full-size product photo instead of externally generated thumbnail unless explicitly requested.",
+      description: "Upload a new primary item photo from a direct image file URL or base64. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... — store product page URLs in sourceUrls/notes instead. Existing primary attachments are deleted only when deletePreviousPrimary=true. Use a full-size product image, not a generated thumbnail, unless explicitly requested.",
       inputSchema: {
         ...authInput,
         itemId,
         imageUrl,
-        photoUrl: imageUrl.describe("Alias for imageUrl."),
+        photoUrl: imageUrl.describe("Alias for imageUrl. Must be a direct image file URL, not a product page."),
         fileName: z.string().min(1).optional(),
         base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
         contentType: z.string().min(1).optional(),
