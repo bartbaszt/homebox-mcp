@@ -4,6 +4,8 @@ Unofficial third-party MCP server for Homebox. It is not affiliated with or endo
 
 The server exposes one configured Homebox instance to external agents over MCP Streamable HTTP. It supports many Homebox users through ChatGPT-compatible OAuth connections or in-memory `sessionKey` sessions, and exposes Homebox groups as collections.
 
+This project was built with AI assistance.
+
 ## Features
 
 - Remote MCP endpoint over HTTP or direct HTTPS.
@@ -238,3 +240,11 @@ npm run test:e2e
 ```
 
 Do not commit `.env`, `.test-access`, tokens, credentials, or captured request bodies containing secrets.
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0 or later.
+
+You may use, modify, host, and redistribute this software, including commercially, provided that you comply with the AGPL. In particular, if you modify this project and make it available to users over a network, you must offer those users access to the corresponding source code of your modified version.
+
+See [LICENSE](LICENSE) for details.

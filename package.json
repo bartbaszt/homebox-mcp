@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Remote HTTP/HTTPS MCP server for one Homebox instance, many collections and users.",
   "type": "module",
+  "license": "AGPL-3.0-or-later",
   "private": true,
   "bin": {
     "homebox-mcp": "dist/index.js"

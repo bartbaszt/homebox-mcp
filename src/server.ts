@@ -1,3 +1,11 @@
+// homebox-mcp
+// Copyright (C) 2026 Bartłomiej Basztura
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
 import { timingSafeEqual } from "node:crypto";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
@@ -73,6 +81,8 @@ export function createHttpApp(state: RuntimeState): express.Express {
       authRequired: Boolean(state.config.apiToken || oauthConfig(state.config).enabled),
       oauthEnabled: oauthConfig(state.config).enabled,
       oauthStorage: state.config.dataDir ? "disk" : "memory",
+      license: "AGPL-3.0-or-later",
+      sourceUrl: "https://github.com/bartbaszt/homebox-mcp",
     });
   });
 
