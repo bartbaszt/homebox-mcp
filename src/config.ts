@@ -8,11 +8,23 @@ export interface AppConfig {
   port: number;
   mcpPath: string;
   apiToken?: string;
+  trustProxy?: boolean;
+  oauth?: OAuthConfig;
   tlsKeyPath?: string;
   tlsCertPath?: string;
   timeoutMs: number;
   maxUploadBytes: number;
   maxDownloadBytes: number;
+}
+
+export interface OAuthConfig {
+  enabled: boolean;
+  publicUrl?: string;
+  issuer?: string;
+  authCodeTtlSeconds: number;
+  accessTokenTtlSeconds: number;
+  refreshTokenTtlSeconds: number;
+  allowInsecureHttp: boolean;
 }
 
 export interface TlsConfig {
@@ -30,6 +42,26 @@ function readInt(env: NodeJS.ProcessEnv, key: string, fallback: number): number 
   return parsed;
 }
 
+function readBool(env: NodeJS.ProcessEnv, key: string, fallback = false): boolean {
+  const raw = env[key];
+  if (!raw) return fallback;
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+function normalizeOptionalUrl(raw: string | undefined, key: string): string | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+  const withScheme = value.startsWith("http://") || value.startsWith("https://") ? value : `https://${value}`;
+  try {
+    const url = new URL(withScheme);
+    url.hash = "";
+    url.search = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch (error) {
+    throw new HomeboxMcpError("config", `Invalid ${key}: ${(error as Error).message}`);
+  }
+}
+
 export function normalizeHomeboxUrl(raw: string): string {
   let url = raw.trim().replace(/\/+$/, "");
   if (!url) throw new HomeboxMcpError("config", "HOMEBOX_BASE_URL is required");
@@ -45,6 +77,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const homeboxBaseUrl = normalizeHomeboxUrl(env.HOMEBOX_BASE_URL ?? env.HOMEBOX_URL ?? "");
   const mcpPath = env.HOMEBOX_MCP_PATH?.trim() || "/mcp";
   if (!mcpPath.startsWith("/")) throw new HomeboxMcpError("config", "HOMEBOX_MCP_PATH must start with '/'");
+  const oauth: OAuthConfig = {
+    enabled: readBool(env, "HOMEBOX_MCP_OAUTH_ENABLED"),
+    publicUrl: normalizeOptionalUrl(env.HOMEBOX_MCP_PUBLIC_URL ?? env.HOMEBOX_MCP_OAUTH_PUBLIC_URL, "HOMEBOX_MCP_PUBLIC_URL"),
+    issuer: normalizeOptionalUrl(env.HOMEBOX_MCP_OAUTH_ISSUER, "HOMEBOX_MCP_OAUTH_ISSUER"),
+    authCodeTtlSeconds: readInt(env, "HOMEBOX_MCP_OAUTH_AUTH_CODE_TTL_SECONDS", 300),
+    accessTokenTtlSeconds: readInt(env, "HOMEBOX_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS", 3600),
+    refreshTokenTtlSeconds: readInt(env, "HOMEBOX_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS", 30 * 24 * 60 * 60),
+    allowInsecureHttp: readBool(env, "HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP"),
+  };
+  if (oauth.enabled && oauth.publicUrl && !oauth.allowInsecureHttp && new URL(oauth.publicUrl).protocol !== "https:") {
+    throw new HomeboxMcpError("config", "HOMEBOX_MCP_PUBLIC_URL must use HTTPS when OAuth is enabled");
+  }
 
   return {
     homeboxBaseUrl,
@@ -52,6 +96,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     port: readInt(env, "HOMEBOX_MCP_PORT", 3000),
     mcpPath,
     apiToken: env.HOMEBOX_MCP_API_TOKEN?.trim() || undefined,
+    trustProxy: readBool(env, "HOMEBOX_MCP_TRUST_PROXY"),
+    oauth,
     tlsKeyPath: env.HOMEBOX_MCP_TLS_KEY?.trim() || undefined,
     tlsCertPath: env.HOMEBOX_MCP_TLS_CERT?.trim() || undefined,
     timeoutMs: readInt(env, "HOMEBOX_API_TIMEOUT_MS", 30_000),

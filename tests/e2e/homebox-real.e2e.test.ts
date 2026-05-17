@@ -101,6 +101,56 @@ describe.skipIf(!shouldRun)("real Homebox E2E over HTTP MCP", () => {
     const logout = await call(client, "homebox_logout", { sessionKey });
     expect(logout.removed).toBe(true);
   });
+
+  it("confirms maintenance, notifiers and templates endpoints", async () => {
+    const login = await call(client, "homebox_login", {
+      username: access.login,
+      password: access.password,
+    });
+    const sessionKey = String(login.sessionKey);
+
+    const maintenance = await call(client, "homebox_list_maintenance", { sessionKey });
+    expect(Array.isArray(asArray(maintenance))).toBe(true);
+
+    const maintenanceCompleted = await call(client, "homebox_list_maintenance", { sessionKey, status: "completed" });
+    expect(Array.isArray(asArray(maintenanceCompleted))).toBe(true);
+
+    const notifiers = await call(client, "homebox_list_notifiers", { sessionKey });
+    expect(Array.isArray(asArray(notifiers))).toBe(true);
+
+    const templates = await call(client, "homebox_list_entity_templates", { sessionKey });
+    expect(Array.isArray(asArray(templates))).toBe(true);
+
+    await call(client, "homebox_logout", { sessionKey });
+  });
+
+  it("auto-detects API surface and routes entities tools to legacy items endpoints", async () => {
+    const login = await call(client, "homebox_login", {
+      username: access.login,
+      password: access.password,
+    });
+    const sessionKey = String(login.sessionKey);
+
+    const surface = await call(client, "homebox_api_surface", { sessionKey });
+    expect(surface).toMatchObject({ surface: "items" });
+
+    const entities = await call(client, "homebox_list_entities", { sessionKey, pageSize: 5 });
+    expect(entities).toHaveProperty("items");
+    expect(Array.isArray(entities.items)).toBe(true);
+
+    const fieldNames = await call(client, "homebox_list_entity_field_names", { sessionKey });
+    expect(Array.isArray(asArray(fieldNames))).toBe(true);
+
+    for (const tool of ["homebox_list_currencies", "homebox_list_entity_types"]) {
+      const result = (await client.callTool({ name: tool, arguments: { sessionKey } })) as CallToolResult;
+      expect(result.isError).toBe(true);
+      const structured = result.structuredContent as { kind?: string; status?: number } | undefined;
+      expect(structured?.kind).toBe("not_found");
+      expect(structured?.status).toBe(404);
+    }
+
+    await call(client, "homebox_logout", { sessionKey });
+  });
 });
 
 async function call(client: Client, name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {

@@ -2,6 +2,7 @@ import { HomeboxMcpError } from "./errors.js";
 
 export type JsonObject = Record<string, unknown>;
 export type QueryValue = string | number | boolean | null | undefined | Array<string | number | boolean>;
+export type ApiSurface = "items" | "entities";
 
 export interface LoginResponse {
   token: string;
@@ -25,6 +26,13 @@ export interface DownloadedAttachment {
   base64: string;
 }
 
+export interface DownloadedFile {
+  contentType?: string;
+  contentLength: number;
+  base64: string;
+  text?: string;
+}
+
 export interface UploadAttachmentInput {
   token: string;
   itemId: string;
@@ -34,9 +42,29 @@ export interface UploadAttachmentInput {
   primary?: boolean;
 }
 
+export interface UploadEntityAttachmentInput {
+  token: string;
+  entityId: string;
+  fileName: string;
+  base64: string;
+  contentType?: string;
+  type?: string;
+  primary?: boolean;
+}
+
+export interface UploadCsvInput {
+  token: string;
+  fileName: string;
+  base64: string;
+  contentType?: string;
+}
+
 const API_PREFIX = "/api/v1/";
 
 export class HomeboxClient {
+  private cachedSurface: ApiSurface | undefined;
+  private surfacePromise: Promise<ApiSurface> | undefined;
+
   constructor(
     private readonly baseUrl: string,
     private readonly timeoutMs: number,
@@ -46,6 +74,46 @@ export class HomeboxClient {
 
   async status(): Promise<unknown> {
     return this.request("GET", "/api/v1/status");
+  }
+
+  async getApiSurface(token: string): Promise<ApiSurface> {
+    if (this.cachedSurface) return this.cachedSurface;
+    if (!this.surfacePromise) {
+      this.surfacePromise = this.probeApiSurface(token).then(
+        (result) => {
+          this.cachedSurface = result;
+          return result;
+        },
+        (err) => {
+          this.surfacePromise = undefined;
+          throw err;
+        },
+      );
+    }
+    return this.surfacePromise;
+  }
+
+  currentApiSurface(): ApiSurface | undefined {
+    return this.cachedSurface;
+  }
+
+  resetApiSurface(): void {
+    this.cachedSurface = undefined;
+    this.surfacePromise = undefined;
+  }
+
+  private async probeApiSurface(token: string): Promise<ApiSurface> {
+    try {
+      await this.rawRequest("GET", "/api/v1/entities", { token, query: { pageSize: 1 } });
+      return "entities";
+    } catch (err) {
+      if (err instanceof HomeboxMcpError && err.status === 404) return "items";
+      throw err;
+    }
+  }
+
+  async listCurrencies(token?: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/currency", token ? { token } : {});
   }
 
   async login(username: string, password: string, stayLoggedIn = true): Promise<LoginResponse> {
@@ -65,102 +133,335 @@ export class HomeboxClient {
   }
 
   async listItems(token: string, input: { page?: number; pageSize?: number; collectionId?: string; query?: Record<string, QueryValue> }): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
     const query: Record<string, QueryValue> = { ...input.query };
     if (input.page !== undefined) query.page = input.page;
     if (input.pageSize !== undefined) query.pageSize = input.pageSize;
+    if (surface === "entities") {
+      return this.request("GET", "/api/v1/entities", { token, query });
+    }
     if (input.collectionId) query.groupId = input.collectionId;
     return this.request("GET", "/api/v1/items", { token, query });
   }
 
+  async listEntities(token: string, input: { q?: string; page?: number; pageSize?: number; tags?: string[]; parentIds?: string[]; query?: Record<string, QueryValue> }): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const query: Record<string, QueryValue> = { ...input.query };
+    if (input.q !== undefined) query.q = input.q;
+    if (input.page !== undefined) query.page = input.page;
+    if (input.pageSize !== undefined) query.pageSize = input.pageSize;
+    if (input.tags) query.tags = input.tags;
+    if (surface === "entities") {
+      if (input.parentIds) query.parentIds = input.parentIds;
+      return this.request("GET", "/api/v1/entities", { token, query });
+    }
+    if (input.parentIds) query.locations = input.parentIds;
+    return this.request("GET", "/api/v1/items", { token, query });
+  }
+
+  async createEntity(token: string, body: JsonObject): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    if (surface === "entities") return this.request("POST", "/api/v1/entities", { token, body });
+    return this.request("POST", "/api/v1/items", { token, body: translateBodyForItems(body) });
+  }
+
+  async exportEntities(token: string): Promise<DownloadedFile> {
+    const surface = await this.getApiSurface(token);
+    const path = surface === "entities" ? "/api/v1/entities/export" : "/api/v1/items/export";
+    return this.downloadFile(path, token);
+  }
+
+  async importEntities(input: UploadCsvInput): Promise<unknown> {
+    const surface = await this.getApiSurface(input.token);
+    const path = surface === "entities" ? "/api/v1/entities/import" : "/api/v1/items/import";
+    return this.request("POST", path, {
+      token: input.token,
+      body: this.multipartFile("csv", input.fileName, input.base64, input.contentType),
+    });
+  }
+
+  async listEntityFieldNames(token: string): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const path = surface === "entities" ? "/api/v1/entities/fields" : "/api/v1/items/fields";
+    return this.request("GET", path, { token });
+  }
+
+  async listEntityFieldValues(token: string, field: string): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const path = surface === "entities" ? "/api/v1/entities/fields/values" : "/api/v1/items/fields/values";
+    return this.request("GET", path, { token, query: { field } });
+  }
+
+  async listEntitiesTree(token: string, withItems?: boolean): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    if (surface === "entities") {
+      return this.request("GET", "/api/v1/entities/tree", { token, query: { withItems } });
+    }
+    return this.request("GET", "/api/v1/locations/tree", { token, query: { withItems } });
+  }
+
+  async getEntity(token: string, entityId: string): Promise<JsonObject> {
+    const surface = await this.getApiSurface(token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    return this.request<JsonObject>("GET", `${prefix}/${encodeURIComponent(entityId)}`, { token });
+  }
+
+  async putEntity(token: string, entityId: string, body: JsonObject): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    const payload = surface === "entities" ? body : translateBodyForItems(body);
+    return this.request("PUT", `${prefix}/${encodeURIComponent(entityId)}`, { token, body: payload });
+  }
+
+  async patchEntity(token: string, entityId: string, body: JsonObject): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    const payload = surface === "entities" ? body : translateBodyForItems(body);
+    return this.request("PATCH", `${prefix}/${encodeURIComponent(entityId)}`, { token, body: payload });
+  }
+
+  async deleteEntity(token: string, entityId: string): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    return this.request("DELETE", `${prefix}/${encodeURIComponent(entityId)}`, { token });
+  }
+
+  async duplicateEntity(token: string, entityId: string, body: JsonObject): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    return this.request("POST", `${prefix}/${encodeURIComponent(entityId)}/duplicate`, { token, body });
+  }
+
+  async getEntityPath(token: string, entityId: string): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    return this.request("GET", `${prefix}/${encodeURIComponent(entityId)}/path`, { token });
+  }
+
+  async listEntityAttachments(token: string, entityId: string): Promise<unknown> {
+    const entity = await this.getEntity(token, entityId);
+    return entity.attachments ?? [];
+  }
+
+  async uploadEntityAttachment(input: UploadEntityAttachmentInput): Promise<unknown> {
+    const surface = await this.getApiSurface(input.token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    const form = this.multipartFile("file", input.fileName, input.base64, input.contentType, {
+      name: input.fileName,
+      type: input.type,
+      primary: input.primary,
+    });
+    return this.request("POST", `${prefix}/${encodeURIComponent(input.entityId)}/attachments`, { token: input.token, body: form });
+  }
+
+  async createExternalEntityAttachment(token: string, entityId: string, body: JsonObject): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    if (surface !== "entities") {
+      throw new HomeboxMcpError("not_found", "External link attachments require the new /entities API (not present on legacy Homebox).", 404);
+    }
+    return this.request("POST", `/api/v1/entities/${encodeURIComponent(entityId)}/attachments/external`, { token, body });
+  }
+
+  async downloadEntityAttachment(token: string, entityId: string, attachmentId: string): Promise<DownloadedFile & { entityId: string; attachmentId: string }> {
+    const surface = await this.getApiSurface(token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    const file = await this.downloadFile(`${prefix}/${encodeURIComponent(entityId)}/attachments/${encodeURIComponent(attachmentId)}`, token);
+    return { entityId, attachmentId, ...file };
+  }
+
+  async updateEntityAttachment(token: string, entityId: string, attachmentId: string, body: JsonObject): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    return this.request("PUT", `${prefix}/${encodeURIComponent(entityId)}/attachments/${encodeURIComponent(attachmentId)}`, { token, body });
+  }
+
+  async deleteEntityAttachment(token: string, entityId: string, attachmentId: string): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    return this.request("DELETE", `${prefix}/${encodeURIComponent(entityId)}/attachments/${encodeURIComponent(attachmentId)}`, { token });
+  }
+
+  async listEntityMaintenance(token: string, entityId: string, status?: "scheduled" | "completed" | "both"): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    return this.request("GET", `${prefix}/${encodeURIComponent(entityId)}/maintenance`, { token, query: { status } });
+  }
+
+  async createEntityMaintenance(token: string, entityId: string, body: JsonObject): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
+    return this.request("POST", `${prefix}/${encodeURIComponent(entityId)}/maintenance`, { token, body });
+  }
+
+  async listEntityTypes(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/entity-types", { token });
+  }
+
+  async createEntityType(token: string, body: JsonObject): Promise<unknown> {
+    return this.request("POST", "/api/v1/entity-types", { token, body });
+  }
+
+  async updateEntityType(token: string, entityTypeId: string, body: JsonObject): Promise<unknown> {
+    return this.request("PUT", `/api/v1/entity-types/${encodeURIComponent(entityTypeId)}`, { token, body });
+  }
+
+  async deleteEntityType(token: string, entityTypeId: string): Promise<unknown> {
+    return this.request("DELETE", `/api/v1/entity-types/${encodeURIComponent(entityTypeId)}`, { token });
+  }
+
+  async listEntityTemplates(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/templates", { token });
+  }
+
+  async createEntityTemplate(token: string, body: JsonObject): Promise<unknown> {
+    return this.request("POST", "/api/v1/templates", { token, body });
+  }
+
+  async getEntityTemplate(token: string, templateId: string): Promise<unknown> {
+    return this.request("GET", `/api/v1/templates/${encodeURIComponent(templateId)}`, { token });
+  }
+
+  async updateEntityTemplate(token: string, templateId: string, body: JsonObject): Promise<unknown> {
+    return this.request("PUT", `/api/v1/templates/${encodeURIComponent(templateId)}`, { token, body });
+  }
+
+  async deleteEntityTemplate(token: string, templateId: string): Promise<unknown> {
+    return this.request("DELETE", `/api/v1/templates/${encodeURIComponent(templateId)}`, { token });
+  }
+
+  async createEntityFromTemplate(token: string, templateId: string, body: JsonObject): Promise<unknown> {
+    return this.request("POST", `/api/v1/templates/${encodeURIComponent(templateId)}/create-item`, { token, body });
+  }
+
+  async listMaintenance(token: string, status?: "scheduled" | "completed" | "both"): Promise<unknown> {
+    return this.request("GET", "/api/v1/maintenance", { token, query: { status: status ?? "both" } });
+  }
+
+  async updateMaintenanceEntry(token: string, maintenanceId: string, body: JsonObject): Promise<unknown> {
+    return this.request("PUT", `/api/v1/maintenance/${encodeURIComponent(maintenanceId)}`, { token, body });
+  }
+
+  async deleteMaintenanceEntry(token: string, maintenanceId: string): Promise<unknown> {
+    return this.request("DELETE", `/api/v1/maintenance/${encodeURIComponent(maintenanceId)}`, { token });
+  }
+
+  async listNotifiers(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/notifiers", { token });
+  }
+
+  async createNotifier(token: string, body: JsonObject): Promise<unknown> {
+    return this.request("POST", "/api/v1/notifiers", { token, body });
+  }
+
+  async testNotifier(token: string, url: string): Promise<unknown> {
+    return this.request("POST", "/api/v1/notifiers/test", { token, query: { url } });
+  }
+
+  async updateNotifier(token: string, notifierId: string, body: JsonObject): Promise<unknown> {
+    return this.request("PUT", `/api/v1/notifiers/${encodeURIComponent(notifierId)}`, { token, body });
+  }
+
+  async deleteNotifier(token: string, notifierId: string): Promise<unknown> {
+    return this.request("DELETE", `/api/v1/notifiers/${encodeURIComponent(notifierId)}`, { token });
+  }
+
   async getItem(token: string, itemId: string): Promise<JsonObject> {
-    return this.request<JsonObject>("GET", `/api/v1/items/${encodeURIComponent(itemId)}`, { token });
+    return this.getEntity(token, itemId);
   }
 
   async createItem(token: string, body: JsonObject): Promise<unknown> {
-    return this.request("POST", "/api/v1/items", { token, body });
+    return this.createEntity(token, body);
   }
 
   async updateItem(token: string, itemId: string, patch: JsonObject): Promise<unknown> {
-    const current = await this.getItem(token, itemId);
-    const body = mergeItemForPut(current, patch);
+    const surface = await this.getApiSurface(token);
+    if (surface === "entities") {
+      return this.patchEntity(token, itemId, patch);
+    }
+    const current = await this.request<JsonObject>("GET", `/api/v1/items/${encodeURIComponent(itemId)}`, { token });
+    const body = mergeItemForPut(current, translateBodyForItems(patch));
     return this.request("PUT", `/api/v1/items/${encodeURIComponent(itemId)}`, { token, body });
   }
 
   async putItem(token: string, itemId: string, body: JsonObject): Promise<unknown> {
-    return this.request("PUT", `/api/v1/items/${encodeURIComponent(itemId)}`, { token, body });
+    return this.putEntity(token, itemId, body);
   }
 
   async patchItem(token: string, itemId: string, body: JsonObject): Promise<unknown> {
-    return this.request("PATCH", `/api/v1/items/${encodeURIComponent(itemId)}`, { token, body });
+    return this.patchEntity(token, itemId, body);
   }
 
   async deleteItem(token: string, itemId: string): Promise<unknown> {
-    return this.request("DELETE", `/api/v1/items/${encodeURIComponent(itemId)}`, { token });
+    return this.deleteEntity(token, itemId);
   }
 
   async listAttachments(token: string, itemId: string): Promise<unknown> {
-    const item = await this.getItem(token, itemId);
-    return item.attachments ?? [];
+    return this.listEntityAttachments(token, itemId);
   }
 
   async downloadAttachment(token: string, itemId: string, attachmentId: string): Promise<DownloadedAttachment> {
-    const response = await this.rawRequest("GET", `/api/v1/items/${encodeURIComponent(itemId)}/attachments/${encodeURIComponent(attachmentId)}`, { token });
-    const contentLengthHeader = response.headers.get("content-length");
-    const advertisedLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : undefined;
-    if (advertisedLength && advertisedLength > this.maxDownloadBytes) {
-      throw new HomeboxMcpError("validation", `Attachment exceeds HOMEBOX_MCP_MAX_DOWNLOAD_BYTES (${this.maxDownloadBytes})`);
-    }
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.byteLength > this.maxDownloadBytes) {
-      throw new HomeboxMcpError("validation", `Attachment exceeds HOMEBOX_MCP_MAX_DOWNLOAD_BYTES (${this.maxDownloadBytes})`);
-    }
+    const file = await this.downloadEntityAttachment(token, itemId, attachmentId);
     return {
       itemId,
       attachmentId,
-      contentType: response.headers.get("content-type") ?? undefined,
-      contentLength: buffer.byteLength,
-      base64: buffer.toString("base64"),
+      contentType: file.contentType,
+      contentLength: file.contentLength,
+      base64: file.base64,
     };
   }
 
   async uploadAttachment(input: UploadAttachmentInput): Promise<unknown> {
-    const bytes = Buffer.from(input.base64, "base64");
-    if (bytes.byteLength > this.maxUploadBytes) {
-      throw new HomeboxMcpError("validation", `Upload exceeds HOMEBOX_MCP_MAX_UPLOAD_BYTES (${this.maxUploadBytes})`);
-    }
-    const form = new FormData();
-    const blob = new Blob([bytes], { type: input.contentType ?? "application/octet-stream" });
-    form.append("file", blob, input.fileName);
-    form.append("name", input.fileName);
-    if (input.primary !== undefined) form.append("primary", String(input.primary));
-
-    return this.request("POST", `/api/v1/items/${encodeURIComponent(input.itemId)}/attachments`, {
+    return this.uploadEntityAttachment({
       token: input.token,
-      body: form,
+      entityId: input.itemId,
+      fileName: input.fileName,
+      base64: input.base64,
+      contentType: input.contentType,
+      primary: input.primary,
     });
   }
 
   async deleteAttachment(token: string, itemId: string, attachmentId: string): Promise<unknown> {
-    return this.request("DELETE", `/api/v1/items/${encodeURIComponent(itemId)}/attachments/${encodeURIComponent(attachmentId)}`, { token });
+    return this.deleteEntityAttachment(token, itemId, attachmentId);
   }
 
   async setPrimaryAttachment(token: string, itemId: string, attachmentId: string): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    if (surface === "entities") {
+      return this.updateEntityAttachment(token, itemId, attachmentId, { primary: true });
+    }
     return this.request("PUT", `/api/v1/items/${encodeURIComponent(itemId)}/attachments/${encodeURIComponent(attachmentId)}/primary`, { token });
   }
 
   async listLocations(token: string): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    if (surface === "entities") {
+      return this.request("GET", "/api/v1/entities", { token, query: { isLocation: true, pageSize: 500 } });
+    }
     return this.request("GET", "/api/v1/locations", { token });
   }
 
   async createLocation(token: string, body: JsonObject): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    if (surface === "entities") {
+      return this.request("POST", "/api/v1/entities", { token, body });
+    }
     return this.request("POST", "/api/v1/locations", { token, body });
   }
 
   async updateLocation(token: string, locationId: string, body: JsonObject): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    if (surface === "entities") {
+      return this.request("PUT", `/api/v1/entities/${encodeURIComponent(locationId)}`, { token, body });
+    }
     return this.request("PUT", `/api/v1/locations/${encodeURIComponent(locationId)}`, { token, body });
   }
 
   async deleteLocation(token: string, locationId: string): Promise<unknown> {
+    const surface = await this.getApiSurface(token);
+    if (surface === "entities") {
+      return this.request("DELETE", `/api/v1/entities/${encodeURIComponent(locationId)}`, { token });
+    }
     return this.request("DELETE", `/api/v1/locations/${encodeURIComponent(locationId)}`, { token });
   }
 
@@ -169,11 +470,11 @@ export class HomeboxClient {
   }
 
   async listCustomFields(token: string): Promise<unknown> {
-    return this.request("GET", "/api/v1/items/fields", { token });
+    return this.listEntityFieldNames(token);
   }
 
   async listCustomFieldValues(token: string, field: string): Promise<unknown> {
-    return this.request("GET", "/api/v1/items/fields/values", { token, query: { field } });
+    return this.listEntityFieldValues(token, field);
   }
 
   async apiRequest(method: string, path: string, options: RequestOptions = {}): Promise<unknown> {
@@ -247,6 +548,36 @@ export class HomeboxClient {
     }
     return normalized;
   }
+
+  private async downloadFile(path: string, token: string): Promise<DownloadedFile> {
+    const response = await this.rawRequest("GET", path, { token });
+    const contentLengthHeader = response.headers.get("content-length");
+    const advertisedLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : undefined;
+    if (advertisedLength && advertisedLength > this.maxDownloadBytes) {
+      throw new HomeboxMcpError("validation", `Download exceeds HOMEBOX_MCP_MAX_DOWNLOAD_BYTES (${this.maxDownloadBytes})`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.byteLength > this.maxDownloadBytes) {
+      throw new HomeboxMcpError("validation", `Download exceeds HOMEBOX_MCP_MAX_DOWNLOAD_BYTES (${this.maxDownloadBytes})`);
+    }
+    const contentType = response.headers.get("content-type") ?? undefined;
+    const text = contentType && /^(text\/|application\/(json|xml|csv)|.*\+json)/i.test(contentType) ? buffer.toString("utf8") : undefined;
+    return { contentType, contentLength: buffer.byteLength, base64: buffer.toString("base64"), text };
+  }
+
+  private multipartFile(fieldName: string, fileName: string, base64: string, contentType?: string, fields: Record<string, unknown> = {}): FormData {
+    const bytes = Buffer.from(base64, "base64");
+    if (bytes.byteLength > this.maxUploadBytes) {
+      throw new HomeboxMcpError("validation", `Upload exceeds HOMEBOX_MCP_MAX_UPLOAD_BYTES (${this.maxUploadBytes})`);
+    }
+    const form = new FormData();
+    const blob = new Blob([bytes], { type: contentType ?? "application/octet-stream" });
+    form.append(fieldName, blob, fileName);
+    for (const [key, value] of Object.entries(fields)) {
+      if (value !== undefined && value !== null) form.append(key, String(value));
+    }
+    return form;
+  }
 }
 
 export function authHeader(token: string): string {
@@ -300,4 +631,31 @@ function normalizeTokenResponse(response: LoginResponse, operation: string): Log
   const token = response.token ?? response.raw;
   if (!token) throw new HomeboxMcpError("auth", `Homebox ${operation} response did not include a token`);
   return { ...response, token };
+}
+
+export function translateBodyForItems(body: JsonObject): JsonObject {
+  const out: JsonObject = { ...body };
+  if (typeof out.parentId === "string" || out.parentId === null) {
+    if (out.locationId === undefined) out.locationId = out.parentId;
+  }
+  delete out.parentId;
+  if (typeof out.syncChildEntityLocations === "boolean") {
+    if (out.syncChildItemsLocations === undefined) out.syncChildItemsLocations = out.syncChildEntityLocations;
+  }
+  delete out.syncChildEntityLocations;
+  delete out.entityTypeId;
+  return out;
+}
+
+export function translateBodyForEntities(body: JsonObject): JsonObject {
+  const out: JsonObject = { ...body };
+  if (typeof out.locationId === "string" || out.locationId === null) {
+    if (out.parentId === undefined) out.parentId = out.locationId;
+  }
+  delete out.locationId;
+  if (typeof out.syncChildItemsLocations === "boolean") {
+    if (out.syncChildEntityLocations === undefined) out.syncChildEntityLocations = out.syncChildItemsLocations;
+  }
+  delete out.syncChildItemsLocations;
+  return out;
 }

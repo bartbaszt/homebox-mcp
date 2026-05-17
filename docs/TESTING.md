@@ -13,10 +13,15 @@ Coverage:
 - URL normalization.
 - Login and session registration.
 - Token refresh with no double `Bearer` prefix.
+- Currency endpoint direct client/tool coverage.
+- Current `/entities`, entity attachments, maintenance, entity types and templates direct endpoint mapping.
 - Item listing and detail calls.
 - Full item update via GET-merge-PUT preserving custom fields and tags.
 - MCP endpoint API-token enforcement.
+- ChatGPT-style OAuth DCR + PKCE connection flow.
+- OAuth-authenticated tool calls without `homebox_login` or `sessionKey`.
 - Tool calls through Streamable HTTP client.
+- Auto-detection of API surface and routing: legacy method names hitting `/entities` when the new API is available, new method names hitting `/items` (with parameter/body translation) when only the legacy API is available.
 
 ## Real E2E
 
@@ -36,6 +41,9 @@ The default E2E is read-only:
 - Logs into Homebox with credentials from `.test-access`.
 - Refreshes token.
 - Reads status, collections/groups, items, item detail, locations, tags, custom fields, custom field values for one existing field.
+- Reads maintenance log (default `status=both`), notifiers list, entity templates list.
+- Verifies `homebox_api_surface` reports `items` on v0.25.0 and that entity-named tools (`homebox_list_entities`, `homebox_list_entity_field_names`) succeed via auto-routing to `/items` endpoints.
+- Asserts endpoints that have no legacy fallback (`homebox_list_currencies`, `homebox_list_entity_types`) return `kind: not_found, status: 404` on legacy Homebox.
 - Verifies generic `homebox_api_request`.
 - Verifies bad session handling.
 
