@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+.codenomad/
+.git/
+.env
+.env.*
+.test-access
+*.log
+*.tsbuildinfo
