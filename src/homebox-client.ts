@@ -671,12 +671,17 @@ const safeLookup: HttpRequestOptions["lookup"] = (hostname, options, callback) =
 };
 
 async function resolveSafeAddress(hostname: string, family?: number): Promise<{ address: string; family: 4 | 6 }> {
-  const addresses = await dnsLookup(hostname, { all: true, family: family === 4 || family === 6 ? family : 0, verbatim: true });
-  if (addresses.length === 0) throw new HomeboxMcpError("validation", `Public URL host '${hostname}' did not resolve`);
-  const blocked = addresses.filter(({ address }) => isBlockedIp(address));
+  const familyOption = family === 4 || family === 6 ? family : 0;
+  let addresses = await dnsLookup(hostname, { all: true, family: familyOption, verbatim: true });
+  if (addresses.length === 0 || !addresses.some((a) => a.address)) {
+    addresses = await dnsLookup(hostname, { all: true, family: familyOption });
+  }
+  const valid = addresses.filter((a) => typeof a.address === "string" && a.address);
+  if (valid.length === 0) throw new HomeboxMcpError("validation", `Public URL host '${hostname}' did not resolve`);
+  const blocked = valid.filter(({ address }) => isBlockedIp(address));
   if (blocked.length > 0) throw new HomeboxMcpError("validation", `Public URL host '${hostname}' resolves to private, loopback, link-local, multicast, or reserved address`);
-  const first = addresses[0];
-  return { address: first.address, family: first.family as 4 | 6 };
+  const first = valid[0];
+  return { address: first.address, family: (typeof first.family === "number" ? first.family : isIP(first.address) === 6 ? 6 : 4) as 4 | 6 };
 }
 
 async function readFetchResponseLimited(response: Response, limit: number, message: string): Promise<Buffer> {
