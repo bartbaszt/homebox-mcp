@@ -64,7 +64,9 @@ Healthcheck:
 curl http://127.0.0.1:3000/health
 ```
 
-Full runbook including ChatGPT setup: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+Full user guide: [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md).
+
+Full deployment runbook including ChatGPT setup: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## ChatGPT Setup
 

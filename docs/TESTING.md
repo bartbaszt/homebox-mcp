@@ -17,6 +17,8 @@ Coverage:
 - Current `/entities`, entity attachments, maintenance, entity types and templates direct endpoint mapping.
 - Item listing and detail calls.
 - Full item update via GET-merge-PUT preserving custom fields and tags.
+- Workflow helpers for tag resolution, location creation, full item creation, bulk upsert, primary photo replacement and public URL validation.
+- Workflow payload mapping uses `purchaseTime` for purchase date and rejects `purchaseDate` in generated payloads.
 - MCP endpoint API-token enforcement.
 - ChatGPT-style OAuth DCR + PKCE connection flow.
 - OAuth-authenticated tool calls without `homebox_login` or `sessionKey`.

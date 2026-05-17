@@ -12,7 +12,7 @@
 
 - `homebox_status`: `GET /api/v1/status`.
 - `homebox_list_currencies`: `GET /api/v1/currency` (current docs show `GET /v1/currency`).
-- `homebox_api_request`: any relative `/api/v1/...` path with GET/POST/PUT/PATCH/DELETE.
+- `homebox_api_request`: low-level escape hatch for relative `/api/v1/...` paths with GET/POST/PUT/PATCH/DELETE. Prefer typed tools; caller owns payload compatibility.
 
 ## Collections
 
@@ -26,8 +26,26 @@ HomeboxAiHelper verified groups as the stable collection-like concept in Homebox
 - `homebox_get_item`: `GET /api/v1/items/{id}`.
 - `homebox_create_item`: `POST /api/v1/items`.
 - `homebox_update_item`: GET-merge-`PUT /api/v1/items/{id}`.
+- `homebox_put_item`: direct full `PUT /api/v1/items/{id}`.
 - `homebox_patch_item`: `PATCH /api/v1/items/{id}`.
 - `homebox_delete_item`: `DELETE /api/v1/items/{id}`.
+
+`homebox_update_item` accepts a `patch` object and is preferred for Homebox v0.25. Supported v0.25 item fields include `name`, `description`, `quantity`, `insured`, `archived`, `assetId`, `serialNumber`, `modelNumber`, `manufacturer`, `lifetimeWarranty`, `warrantyExpires`, `warrantyDetails`, `purchaseTime`, `purchaseFrom`, `purchasePrice`, `soldTime`, `soldTo`, `soldPrice`, `soldNotes`, `notes`, `locationId`, `tagIds`, and `fields`.
+
+Use `purchaseTime` for Homebox purchase date. Do not use `purchaseDate`.
+
+## Workflow Tools
+
+- `homebox_resolve_tags`: resolves tag names from `labels` or `names`; exact match first, then case-insensitive match; optional creation through `POST /api/v1/tags`.
+- `homebox_resolve_location`: lookup-focused location name/path resolver. Defaults to `createMissing=false`.
+- `homebox_find_or_create_location`: location name/path resolver that creates missing path segments by default.
+- `homebox_create_item_full`: resolves tags/location, stores external refs as custom fields, creates item, and optionally uploads a primary photo from public URL/base64.
+- `homebox_upload_primary_photo_from_file`: uploads and sets a primary item photo. Public `imageUrl`/`photoUrl` preferred; base64 fallback; local paths unsupported.
+- `homebox_replace_primary_photo`: uploads a new primary item photo and optionally deletes previous primary attachments.
+- `homebox_upsert_items_bulk`: creates or updates many items; dedupe defaults to `externalAssetId`, `orderId`, then `name`.
+- `homebox_import_items_bulk`: import-oriented alias for bulk upsert, useful for sources such as AliExpress orders.
+
+Workflow item fields include `name`, `description`, `quantity`, `purchaseTime`, `purchaseFrom`, `purchasePrice`, `manufacturer`, `modelNumber`, `serialNumber`, `notes`, `labels`, `externalAssetId`, `orderId`, `sourceUrls`, and `photoUrl`.
 
 ## Entities And Related Current API
 
