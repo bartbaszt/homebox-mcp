@@ -61,7 +61,7 @@ docker compose logs -f homebox-mcp
 Healthcheck:
 
 ```bash
-curl http://127.0.0.1:3101/health
+curl http://127.0.0.1:3000/health
 ```
 
 Full runbook including ChatGPT setup: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
@@ -73,7 +73,7 @@ In ChatGPT → Settings → Connectors (or MCP Apps):
 | Field | Value |
 |---|---|
 | **Name** | Homebox |
-| **URL** | `https://homebox-mcp.bbasztura.eu/mcp` |
+| **URL** | `https://mcp.example.com/mcp` |
 | **Auth** | OAuth (auto-discovered via `/.well-known/oauth-protected-resource`) |
 
 On first connection, ChatGPT opens a login form where you enter Homebox credentials once. The password is discarded; ChatGPT stores the OAuth token pair in connector settings. Subsequent tool calls work without `sessionKey`.

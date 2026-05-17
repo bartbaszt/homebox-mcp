@@ -1,23 +1,23 @@
 # Deployment
 
-Instrukcja wdrożenia produkcyjnego przez Docker Compose z gotowym obrazem z GHCR.
+Production deployment guide using Docker Compose with pre-built images from GHCR or local builds.
 
-## Wymagania
+## Requirements
 
-- Docker Engine z wtyczką Compose v2.
-- Dostęp sieciowy z kontenera do `HOMEBOX_BASE_URL`.
-- Publiczny adres HTTPS dla OAuth/ChatGPT (np. cloudflared tunnel).
-- `HOMEBOX_MCP_API_TOKEN` albo `HOMEBOX_MCP_OAUTH_ENABLED=true` dla exposingu publicznego.
+- Docker Engine with Compose v2 plugin.
+- Network access from the container to `HOMEBOX_BASE_URL`.
+- Public HTTPS address for OAuth/ChatGPT (e.g. via reverse proxy or Cloudflare Tunnel).
+- `HOMEBOX_MCP_API_TOKEN` or `HOMEBOX_MCP_OAUTH_ENABLED=true` for any externally exposed deployment.
 
-## Szybkie uruchomienie (GHCR)
+## Quick Start (GHCR Image)
 
-Na serwerze docelowym:
+On the target host:
 
 ```bash
 mkdir -p /srv/homebox-mcp && cd /srv/homebox-mcp
 ```
 
-Utwórz `compose.yml`:
+Create `compose.yml`:
 
 ```yaml
 name: homebox-mcp
@@ -50,36 +50,40 @@ services:
       - ALL
 ```
 
-Utwórz `.env` (przykład z OAuth dla ChatGPT za cloudflared):
+Create `.env`:
 
 ```dotenv
-HOMEBOX_BASE_URL=https://homebox.bbasztura.eu
+HOMEBOX_BASE_URL=https://homebox.example.com
 HOMEBOX_MCP_HOST=0.0.0.0
 HOMEBOX_MCP_PORT=3000
 HOMEBOX_MCP_PATH=/mcp
 HOMEBOX_MCP_PUBLISH_PORT=3101
 
-HOMEBOX_MCP_API_TOKEN=T98f4q5WSHyMtkl0ig1Gj3QAwhoY2rPJIUCKXuONv6ZDRame
+# Required for externally exposed deployments
+HOMEBOX_MCP_API_TOKEN=change-me-to-a-random-string
 
-HOMEBOX_MCP_OAUTH_ENABLED=true
-HOMEBOX_MCP_PUBLIC_URL=https://homebox-mcp.bbasztura.eu/mcp
-HOMEBOX_MCP_OAUTH_ISSUER=https://homebox-mcp.bbasztura.eu
-HOMEBOX_MCP_TRUST_PROXY=true
-HOMEBOX_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=3600
-HOMEBOX_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS=2592000
-HOMEBOX_MCP_OAUTH_AUTH_CODE_TTL_SECONDS=300
-HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP=false
+# Optional: enable ChatGPT-compatible OAuth
+# HOMEBOX_MCP_OAUTH_ENABLED=true
+# HOMEBOX_MCP_PUBLIC_URL=https://mcp.example.com/mcp
+# HOMEBOX_MCP_OAUTH_ISSUER=https://mcp.example.com
+# HOMEBOX_MCP_TRUST_PROXY=true
+# HOMEBOX_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=3600
+# HOMEBOX_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS=2592000
+# HOMEBOX_MCP_OAUTH_AUTH_CODE_TTL_SECONDS=300
+# HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP=false
 
 HOMEBOX_API_TIMEOUT_MS=30000
 HOMEBOX_MCP_MAX_UPLOAD_BYTES=10485760
 HOMEBOX_MCP_MAX_DOWNLOAD_BYTES=10485760
 ```
 
-Logowanie do GHCR (repo prywatne, token z `read:packages` + `repo`):
+Log in to GHCR (required because the repo is private):
 
 ```bash
-echo ghp_TWÓJ_TOKEN | docker login ghcr.io -u bartbaszt --password-stdin
+echo YOUR_GITHUB_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
 ```
+
+The PAT needs `read:packages` and `repo` scopes.
 
 Start:
 
@@ -96,69 +100,100 @@ Healthcheck:
 curl http://127.0.0.1:3101/health
 ```
 
-MCP endpoint lokalnie: `http://127.0.0.1:3101/mcp`
+## Local Build (Without GHCR)
 
-Publicznie (przez cloudflared): `https://homebox-mcp.bbasztura.eu/mcp`
+```bash
+git clone https://github.com/bartbaszt/homebox-mcp.git
+cd homebox-mcp
+cp .env.example .env
+# edit .env
+docker compose up -d --build
+docker compose logs -f homebox-mcp
+```
 
-## Cloudflared Tunnel
+This uses the `build:` directive in the shipped `docker-compose.yml` to build locally.
 
-Przykładowa konfiguracja — tunnel kieruje ruch na `http://localhost:3101`:
+## Changing the Host Port
+
+`HOMEBOX_MCP_PORT` is the internal container port. The `ports` mapping in `compose.yml` controls the host port.
+
+Example — container stays on `3000`, host publishes `8080`:
+
+```yaml
+ports:
+  - "8080:3000"
+```
+
+`HOMEBOX_MCP_PUBLISH_PORT` is only used by `docker-compose.yml` (development template). For production `compose.yml`, set the port directly in the `ports` mapping.
+
+## Reverse Proxy / Tunnel
+
+Recommended: run the container on internal HTTP and terminate TLS in a reverse proxy or tunnel (Nginx, Caddy, Cloudflare Tunnel, etc.).
+
+The proxy must forward traffic to the container and preserve standard headers:
+
+- `X-Forwarded-Proto`
+- `X-Forwarded-Host`
+- `X-Forwarded-For`
+
+Set `HOMEBOX_MCP_TRUST_PROXY=true` so Express trusts these headers.
+
+### Cloudflare Tunnel Example
 
 ```json
 {
-  "tunnel": "ID_TUNNELA",
+  "tunnel": "YOUR_TUNNEL_ID",
   "ingress": [
     {
-      "hostname": "homebox-mcp.bbasztura.eu",
+      "hostname": "mcp.example.com",
       "service": "http://localhost:3101"
     }
   ]
 }
 ```
 
-Cloudflared automatycznie kończy TLS. `HOMEBOX_MCP_TRUST_PROXY=true` jest wymagane żeby Express ufał nagłówkom `X-Forwarded-*`.
+Cloudflare terminates TLS automatically. No cert files needed.
 
 ## ChatGPT Configuration
 
-W ChatGPT → Settings → Connectors (lub MCP Apps):
+In ChatGPT → Settings → Connectors (or MCP Apps):
 
-| Pole | Wartość |
+| Field | Value |
 |---|---|
 | **Name** | Homebox |
-| **URL** | `https://homebox-mcp.bbasztura.eu/mcp` |
-| **Auth** | OAuth (auto-wykrywane przez `/.well-known/oauth-protected-resource`) |
+| **URL** | `https://mcp.example.com/mcp` |
+| **Auth** | OAuth (auto-discovered via `/.well-known/oauth-protected-resource`) |
 
-Przy pierwszym połączeniu ChatGPT otwiera formularz logowania Homebox. Hasło jest jednorazowe — nie jest przechowywane. ChatGPT zapisuje parę tokenów OAuth w konfiguracji connectora. Następne wywołania narzędzi nie wymagają `sessionKey`.
+On first connection, ChatGPT opens a Homebox login form. The password is used once and discarded. ChatGPT stores the OAuth token pair in connector settings. Subsequent tool calls work without `sessionKey`.
 
-### Autoryzacja statycznym tokenem (bez OAuth)
+### Static Token Auth (Without OAuth)
 
-Dla klientów MCP nieobsługujących OAuth:
+For MCP clients that don't support OAuth:
 
 ```
 Authorization: Bearer <HOMEBOX_MCP_API_TOKEN>
 ```
 
-Wtedy po połączeniu wywołaj `homebox_login` z credentialami Homebox i używaj zwróconego `sessionKey` w kolejnych wywołaniach.
+Then call `homebox_login` with Homebox credentials and use the returned `sessionKey` for subsequent tool calls.
 
-## OAuth/ChatGPT — szczegóły
+## OAuth Details
 
-Zalecane wdrożenie: kontener słucha po HTTP, TLS kończy się w reverse proxy lub cloudflared.
+OAuth requires HTTPS. Set `HOMEBOX_MCP_PUBLIC_URL` to the exact public MCP endpoint URL including the `/mcp` path — the token is bound to this `resource` value.
 
-`HOMEBOX_MCP_PUBLIC_URL` musi być dokładnym publicznym URL endpointu MCP z sufiksem `/mcp`, bo OAuth wiąże token z wartością `resource`.
+Endpoints exposed when OAuth is enabled:
 
-Endpointy OAuth:
+- `GET /.well-known/oauth-protected-resource` — resource metadata
+- `GET /.well-known/oauth-authorization-server` — authorization server metadata
+- `POST /oauth/register` — dynamic client registration (DCR)
+- `GET /oauth/authorize` — Homebox login form
+- `POST /oauth/authorize` — submit credentials, returns auth code
+- `POST /oauth/token` — exchange auth code or refresh token
 
-- `GET /.well-known/oauth-protected-resource`
-- `GET /.well-known/oauth-authorization-server`
-- `POST /oauth/register` — dynamiczna rejestracja klienta (DCR)
-- `GET/POST /oauth/authorize` — formularz logowania Homebox
-- `POST /oauth/token` — authorization_code + refresh_token
+Do not set `HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP=true` in production.
 
-Nie ustawiaj `HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP=true` w produkcji.
+## Direct HTTPS in Container
 
-## Direct HTTPS w kontenerze
-
-Preferuj reverse proxy lub cloudflared. Jeśli musisz użyć HTTPS bezpośrednio w Node, zamontuj certyfikaty:
+Prefer a reverse proxy or tunnel. If you must run HTTPS directly in Node, mount certificates:
 
 ```yaml
 services:
@@ -172,9 +207,9 @@ HOMEBOX_MCP_TLS_KEY=/certs/homebox-mcp.key
 HOMEBOX_MCP_TLS_CERT=/certs/homebox-mcp.crt
 ```
 
-## Aktualizacja
+## Updates
 
-Po nowym buildzie CI (push do `master`):
+After a new CI build (push to `master`):
 
 ```bash
 docker compose pull
@@ -182,48 +217,20 @@ docker compose up -d
 docker compose logs -f homebox-mcp
 ```
 
-## Zmiana portu hosta
-
-`HOMEBOX_MCP_PORT` — port wewnątrz kontenera. Mapowanie w `compose.yml` `ports` steruje portem na hoście.
-
-Przykład: kontener na `3000`, host publikuje `8080`:
-
-```yaml
-ports:
-  - "8080:3000"
-```
-
-## Budowanie lokalne (bez GHCR)
-
-Do develomentu lokalnego:
+Clean up old images:
 
 ```bash
-git clone https://github.com/bartbaszt/homebox-mcp.git
-cd homebox-mcp
-cp .env.example .env
-# edytuj .env
-docker compose up -d --build
+docker image prune
 ```
 
-Zmień w `compose.yml`:
+## CI Image Registry
 
-```yaml
-services:
-  homebox-mcp:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    # usuń: image: ghcr.io/bartbaszt/homebox-mcp:latest
-```
+GitHub Actions (`.github/workflows/docker.yml`) builds and pushes the image to `ghcr.io/bartbaszt/homebox-mcp` on every push to `master`. Tags: `latest` + commit SHA.
 
-## Rejestr obrazów CI
+## Security Notes
 
-GitHub Actions (`.github/workflows/docker.yml`) buduje i publikuje obraz do `ghcr.io/bartbaszt/homebox-mcp` przy pushu do `master`. Tagi: `latest` + SHA commita.
-
-## Uwagi bezpieczeństwa
-
-- Nie commituj `.env`, tokenów, certyfikatów ani `.test-access`.
-- Dla publicznego MCP wymagaj `HOMEBOX_MCP_API_TOKEN` albo OAuth.
-- OAuth i mapowanie tokenów Homebox są w pamięci; restart kontenera wymaga ponownego połączenia klienta OAuth.
-- Healthcheck `/health` nie ujawnia sekretów, pokazuje podstawowy status konfiguracji.
-- Po wystawieniu na publiczną sieć zawsze używaj HTTPS (cloudflared/reverse proxy).
+- Never commit `.env`, tokens, certificates, or `.test-access`.
+- For any publicly exposed MCP server, require `HOMEBOX_MCP_API_TOKEN` or enable OAuth.
+- OAuth tokens and Homebox session mappings are in-memory only; restarting the container invalidates all active sessions and requires reconnecting.
+- The `/health` endpoint does not expose secrets but shows basic configuration status.
+- Always use HTTPS (reverse proxy or tunnel) when exposing the service publicly.
