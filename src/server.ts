@@ -13,7 +13,7 @@ import { HomeboxClient } from "./homebox-client.js";
 import { OAuthError, OAuthStore } from "./oauth-store.js";
 import type { HomeboxSession } from "./session-store.js";
 import { SessionStore } from "./session-store.js";
-import { registerHomeboxTools } from "./tools.js";
+import { registerHomeboxResources, registerHomeboxTools } from "./tools.js";
 
 export interface RuntimeState {
   config: AppConfig;
@@ -49,6 +49,7 @@ export function createMcpServer(state: RuntimeState, connectionSession?: Homebox
     },
   );
   registerHomeboxTools(server, { homebox: state.homebox, sessions: state.sessions, connectionSession });
+  registerHomeboxResources(server, { homebox: state.homebox, sessions: state.sessions, connectionSession });
   return server;
 }
 

@@ -1,5 +1,6 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { HomeboxClient, JsonObject, QueryValue } from "./homebox-client.js";
@@ -576,7 +577,7 @@ function registerEntityAttachmentTools(server: McpServer, state: ToolState): voi
     "homebox_download_entity_attachment",
     {
       title: "Download Entity Attachment",
-      description: "Download entity attachment via GET /api/v1/entities/{id}/attachments/{attachmentId}; returns base64 within configured size limit.",
+      description: "Download entity attachment via GET /api/v1/entities/{id}/attachments/{attachmentId}; returns base64 within configured size limit. For image content types, returns image content viewable by multimodal models.",
       inputSchema: { ...authInput, entityId, attachmentId },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
@@ -760,7 +761,7 @@ function registerAttachmentTools(server: McpServer, state: ToolState): void {
     "homebox_download_attachment",
     {
       title: "Download Attachment",
-      description: "Download an attachment and return base64 content within configured size limit.",
+      description: "Download an attachment and return base64 content within configured size limit. For image attachments, returns image content viewable by multimodal models.",
       inputSchema: { ...authInput, itemId, attachmentId },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
@@ -935,11 +936,14 @@ function optionalTokenFrom(args: { sessionKey?: string; token?: string }, state:
   return state.connectionSession?.token;
 }
 
+export type DownloadResult = { contentType?: string; contentLength: number; base64: string; text?: string; itemId?: string; attachmentId?: string; entityId?: string };
+
 async function toolResult<T>(action: () => T | Promise<T>, message: string): Promise<CallToolResult> {
   try {
     const data = await action();
+    const content = downloadImageContent(data);
     return {
-      content: [{ type: "text", text: `${message}.` }],
+      content: content ?? [{ type: "text", text: `${message}.` }],
       structuredContent: toStructuredContent(data),
     };
   } catch (error) {
@@ -950,6 +954,53 @@ async function toolResult<T>(action: () => T | Promise<T>, message: string): Pro
       structuredContent: safe,
     };
   }
+}
+
+function downloadImageContent(data: unknown): CallToolResult["content"] | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const d = data as DownloadResult;
+  if (typeof d.base64 !== "string" || !d.contentType?.startsWith("image/")) return undefined;
+  return [
+    { type: "image", data: d.base64, mimeType: d.contentType },
+    { type: "text", text: `Attachment downloaded (${d.contentType}, ${d.contentLength} bytes).` },
+  ];
+}
+
+export function registerHomeboxResources(server: McpServer, state: ToolState): void {
+  const attachmentTemplate = new ResourceTemplate("homebox://attachments/{entityId}/{attachmentId}", {
+    list: undefined,
+    complete: {
+      entityId: async (value) => {
+        const token = state.connectionSession?.token;
+        if (!token) return [];
+        try {
+          const entities = await state.homebox.listEntities(token, { q: value, pageSize: 10 });
+          const items = (entities as { items?: Array<{ id: string; name: string }> }).items ?? [];
+          return items.map((e) => e.id);
+        } catch { return []; }
+      },
+      attachmentId: async () => [],
+    },
+  });
+
+  server.registerResource(
+    "homebox-attachment",
+    attachmentTemplate,
+    { description: "Download a Homebox entity attachment. Returns image content for images, base64 blob for other file types. Requires OAuth or connection-authenticated session." },
+    async (uri, variables) => {
+      const token = state.connectionSession?.token;
+      if (!token) throw new HomeboxMcpError("auth", "No authenticated session for resource read. Use homebox_download_attachment or homebox_download_entity_attachment tool instead.");
+      const { entityId, attachmentId } = variables as Record<string, string>;
+      const file = await state.homebox.downloadEntityAttachment(token, entityId, attachmentId);
+      if (file.contentType?.startsWith("image/")) {
+        return { contents: [{ uri: uri.href, mimeType: file.contentType, blob: file.base64 }] };
+      }
+      if (file.text !== undefined) {
+        return { contents: [{ uri: uri.href, mimeType: file.contentType ?? "text/plain", text: file.text }] };
+      }
+      return { contents: [{ uri: uri.href, mimeType: file.contentType ?? "application/octet-stream", blob: file.base64 }] };
+    },
+  );
 }
 
 function toStructuredContent(data: unknown): Record<string, unknown> {
