@@ -14,7 +14,7 @@ afterEach(async () => {
 describe("Homebox workflows", () => {
   it("resolves existing tags and creates missing tags", async () => {
     mock = await startMockHomebox((req, res) => {
-      if (req.method === "GET" && req.path === "/api/v1/tags") return json(res, 200, [{ id: "tag-1", name: "Tool" }]);
+      if (req.method === "GET" && req.path === "/api/v1/tags") return json(res, 200, [{ id: "tag-lower", name: "tool" }, { id: "tag-1", name: "Tool" }]);
       if (req.method === "POST" && req.path === "/api/v1/tags") {
         expect(req.body).toEqual({ name: "Kitchen" });
         return json(res, 201, { id: "tag-2", name: "Kitchen" });
@@ -59,9 +59,15 @@ describe("Homebox workflows", () => {
           name: "Drill",
           description: "Cordless",
           quantity: 2,
+          purchaseTime: "2026-05-17",
+          purchaseFrom: "AliExpress",
+          manufacturer: "Acme",
+          modelNumber: "D-42",
+          notes: "Imported order",
           locationId: "loc-1",
           tagIds: ["tag-1"],
         });
+        expect(req.body).not.toHaveProperty("purchaseDate");
         const body = req.body as { parentId?: unknown; fields?: Array<{ name: string; textValue: string }> };
         expect(body.parentId).toBeUndefined();
         expect(body.fields).toEqual([
@@ -79,6 +85,11 @@ describe("Homebox workflows", () => {
       name: "Drill",
       description: "Cordless",
       quantity: 2,
+      purchaseTime: "2026-05-17",
+      purchaseFrom: "AliExpress",
+      manufacturer: "Acme",
+      modelNumber: "D-42",
+      notes: "Imported order",
       locationName: "Garage",
       labels: ["Tool"],
       externalAssetId: "asset-1",

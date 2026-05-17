@@ -47,10 +47,24 @@ export interface ItemWorkflowInput {
   name: string;
   description?: string;
   quantity?: number;
-  purchaseDate?: string;
+  insured?: boolean;
+  archived?: boolean;
+  assetId?: string;
+  serialNumber?: string;
+  modelNumber?: string;
+  manufacturer?: string;
+  lifetimeWarranty?: boolean;
+  warrantyExpires?: string;
+  warrantyDetails?: string;
+  purchaseTime?: string;
   purchasePrice?: number;
   currency?: string;
   purchaseFrom?: string;
+  soldTime?: string;
+  soldTo?: string;
+  soldPrice?: number;
+  soldNotes?: string;
+  notes?: string;
   externalSource?: string;
   externalAssetId?: string;
   orderId?: string;
@@ -134,10 +148,17 @@ export async function resolveTags(client: HomeboxClient, token: string, input: R
   if (requested.length === 0) return result;
 
   const tags = asRecords(await client.listTags(token));
-  const byName = new Map(tags.map((tag) => [key(readName(tag)), tag]));
+  const exactByName = new Map<string, JsonObject>();
+  const byName = new Map<string, JsonObject>();
+  for (const tag of tags) {
+    const name = readName(tag);
+    if (!name) continue;
+    exactByName.set(name, tag);
+    byName.set(key(name), tag);
+  }
 
   for (const name of requested) {
-    const existing = byName.get(key(name));
+    const existing = exactByName.get(name) ?? byName.get(key(name));
     if (existing) {
       result.resolved.push({ name, id: readId(existing), created: false, tag: existing });
       continue;
@@ -154,6 +175,7 @@ export async function resolveTags(client: HomeboxClient, token: string, input: R
     if (!created) throw new HomeboxMcpError("homebox", `Homebox did not return a tag object after creating '${name}'`);
     const id = readId(created);
     if (!id) throw new HomeboxMcpError("homebox", `Homebox created tag '${name}' without an id`);
+    exactByName.set(readName(created), created);
     byName.set(key(name), created);
     result.resolved.push({ name, id, created: true, tag: created });
   }
@@ -320,10 +342,24 @@ function buildItemPayload(input: ItemWorkflowInput, tagIds: string[]): JsonObjec
   setDefined(body, "name", input.name);
   setDefined(body, "description", input.description);
   setDefined(body, "quantity", input.quantity);
-  setDefined(body, "purchaseDate", input.purchaseDate);
+  setDefined(body, "insured", input.insured);
+  setDefined(body, "archived", input.archived);
+  setDefined(body, "assetId", input.assetId);
+  setDefined(body, "serialNumber", input.serialNumber);
+  setDefined(body, "modelNumber", input.modelNumber);
+  setDefined(body, "manufacturer", input.manufacturer);
+  setDefined(body, "lifetimeWarranty", input.lifetimeWarranty);
+  setDefined(body, "warrantyExpires", input.warrantyExpires);
+  setDefined(body, "warrantyDetails", input.warrantyDetails);
+  setDefined(body, "purchaseTime", input.purchaseTime);
   setDefined(body, "purchasePrice", input.purchasePrice);
   setDefined(body, "currency", input.currency);
   setDefined(body, "purchaseFrom", input.purchaseFrom);
+  setDefined(body, "soldTime", input.soldTime);
+  setDefined(body, "soldTo", input.soldTo);
+  setDefined(body, "soldPrice", input.soldPrice);
+  setDefined(body, "soldNotes", input.soldNotes);
+  setDefined(body, "notes", input.notes);
   if (tagIds.length > 0) body.tagIds = tagIds;
 
   const fields = workflowFields(input);

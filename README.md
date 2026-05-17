@@ -152,10 +152,38 @@ With static MCP auth or local agents:
 - Notifiers: `homebox_list_notifiers`, `homebox_create_notifier`, `homebox_test_notifier`, `homebox_update_notifier`, `homebox_delete_notifier`.
 - Attachments: `homebox_list_attachments`, `homebox_download_attachment`, `homebox_upload_attachment`, `homebox_delete_attachment`, `homebox_set_primary_attachment`.
 - Locations/tags/fields: `homebox_list_locations`, `homebox_create_location`, `homebox_update_location`, `homebox_delete_location`, `homebox_list_tags`, `homebox_list_custom_fields`, `homebox_list_custom_field_values` (requires `field`).
-- Workflows: `homebox_resolve_tags`, `homebox_find_or_create_location`, `homebox_create_item_full`, `homebox_upload_primary_photo_from_file`, `homebox_replace_primary_photo`, `homebox_upsert_items_bulk`.
+- Workflows: `homebox_resolve_tags`, `homebox_resolve_location`, `homebox_find_or_create_location`, `homebox_create_item_full`, `homebox_upload_primary_photo_from_file`, `homebox_replace_primary_photo`, `homebox_upsert_items_bulk`, `homebox_import_items_bulk`.
 - Diagnostics: `homebox_api_surface` reports the detected Homebox API version (`items` for legacy v0.25.0, `entities` for the new Entity Merge API).
 
 Workflow photo tools prefer public `imageUrl`/`photoUrl` values. Local paths such as `/mnt/data/...` are not supported; direct `base64` is only a fallback.
+
+Homebox UI field mapping for item tools:
+
+| Homebox UI | API field |
+|---|---|
+| Purchase date / Data zakupu | `purchaseTime` |
+| Purchased from / Zakupiono od | `purchaseFrom` |
+| Purchase price / Cena zakupu | `purchasePrice` |
+| Manufacturer / Producent | `manufacturer` |
+| Model | `modelNumber` |
+| Serial number / Numer seryjny | `serialNumber` |
+| Notes / Notatki | `notes` |
+| Location / Lokalizacja | `locationId` |
+| Tags / Tagi | `tagIds` |
+| Primary photo / thumbnail | primary attachment / `imageId` |
+
+Use `purchaseTime` for purchase date. Do not use `purchaseDate`.
+
+Recommended purchase/import workflow:
+
+1. Resolve location by name with `homebox_resolve_location` or `homebox_find_or_create_location`.
+2. Resolve or create tags with `homebox_resolve_tags`.
+3. Create an item with stable fields: `name`, `description`, `quantity`, `locationId`, `tagIds`.
+4. Patch `purchasePrice`, `purchaseTime`, `purchaseFrom`, `manufacturer`, `modelNumber`, `notes`.
+5. Upload the primary photo.
+6. Verify final fields with `homebox_get_item`.
+
+For bulk imports, prefer `homebox_import_items_bulk` or `homebox_upsert_items_bulk` over manual orchestration.
 
 ## Multi-Version Compatibility
 
@@ -177,6 +205,14 @@ Tool routing in both directions:
 Body translation: `parentId` <-> `locationId`, `syncChildEntityLocations` <-> `syncChildItemsLocations`, `entityTypeId` is stripped when routing to legacy items.
 
 Tools without legacy equivalents return a structured `not_found` error on `items` surface: `homebox_list_currencies`, `homebox_list_entity_types` (and friends), `homebox_create_external_entity_attachment`.
+
+Legacy Homebox v0.25 constraints:
+
+- Prefer item tools (`homebox_list_items`, `homebox_get_item`, `homebox_update_item`, `homebox_upload_attachment`) when `homebox_api_surface` returns `items`; entity tools are for the newer Entity Merge API.
+- `homebox_update_item` reads the current item, merges `patch`, preserves fields/tags/location, and PUTs a full payload because partial PUT can fail.
+- Homebox v0.25 may ignore some fields on item creation. If fields such as `purchaseTime`, `purchaseFrom`, `manufacturer` or `modelNumber` matter, verify with `homebox_get_item` and patch missing fields.
+- Homebox `assetId` may be auto-generated. External order IDs such as AliExpress `AE-*` should usually be stored in `notes` or custom fields unless overwriting `assetId` is known to work.
+- Large mixed update patches may cause Homebox 500. Prefer smaller patches when updating legacy v0.25 items.
 
 ## Tests
 

@@ -33,6 +33,78 @@ const base64FileInput = {
   contentType: z.string().min(1).optional(),
 };
 
+const itemUiApiMapping = [
+  "Homebox UI to API field mapping:",
+  "- Purchase date / Data zakupu -> purchaseTime",
+  "- Purchased from / Zakupiono od -> purchaseFrom",
+  "- Purchase price / Cena zakupu -> purchasePrice",
+  "- Manufacturer / Producent -> manufacturer",
+  "- Model -> modelNumber",
+  "- Serial number / Numer seryjny -> serialNumber",
+  "- Notes / Notatki -> notes",
+  "- Location / Lokalizacja -> locationId",
+  "- Tags / Tagi -> tagIds",
+  "- Primary photo / thumbnail -> primary attachment or imageId",
+  "Use purchaseTime for purchase date. Do not use purchaseDate.",
+].join("\n");
+
+const legacyItemPatchFields = [
+  "Supported patch fields for Homebox v0.25 items:",
+  "name, description, quantity, insured, archived, assetId, serialNumber,",
+  "modelNumber, manufacturer, lifetimeWarranty, warrantyExpires,",
+  "warrantyDetails, purchaseTime, purchaseFrom, purchasePrice,",
+  "soldTime, soldTo, soldPrice, soldNotes, notes, locationId, tagIds, fields.",
+].join("\n");
+
+const legacyV025Notes = [
+  "Homebox v0.25 notes:",
+  "- Item update uses GET, merges patch, then PUTs full payload because partial PUT can fail.",
+  "- Homebox v0.25 may ignore some fields on create; verify important fields with homebox_get_item and patch missing fields.",
+  "- Homebox assetId may be auto-generated; external order IDs usually belong in notes or custom fields unless overwriting assetId is known to work.",
+  "- Large mixed update patches may cause Homebox 500; prefer smaller patches for legacy v0.25 items.",
+].join("\n");
+
+const purchaseImportWorkflow = [
+  "Recommended purchase/import workflow:",
+  "1. Resolve location by name.",
+  "2. Resolve or create tags.",
+  "3. Create item with stable fields: name, description, quantity, locationId, tagIds.",
+  "4. Patch purchasePrice, purchaseTime, purchaseFrom, manufacturer, modelNumber, notes.",
+  "5. Upload primary photo.",
+  "6. Verify with homebox_get_item.",
+].join("\n");
+
+const itemPayloadFields = {
+  name: z.string().min(1).optional().describe("Item name."),
+  description: z.string().min(1).optional(),
+  quantity: z.number().positive().optional(),
+  insured: z.boolean().optional(),
+  archived: z.boolean().optional(),
+  assetId: z.string().min(1).optional().describe("Homebox asset ID. May be auto-generated on v0.25; do not store external order IDs here unless intended."),
+  serialNumber: z.string().min(1).optional(),
+  modelNumber: z.string().min(1).optional().describe("Homebox UI: Model."),
+  manufacturer: z.string().min(1).optional().describe("Homebox UI: Manufacturer / Producent."),
+  lifetimeWarranty: z.boolean().optional(),
+  warrantyExpires: z.string().min(1).optional(),
+  warrantyDetails: z.string().min(1).optional(),
+  purchaseTime: z.string().min(1).optional().describe("Homebox UI: Purchase date / Data zakupu. Do not use purchaseDate."),
+  purchaseFrom: z.string().min(1).optional().describe("Homebox UI: Purchased from / Zakupiono od."),
+  purchasePrice: z.number().nonnegative().optional().describe("Homebox UI: Purchase price / Cena zakupu."),
+  soldTime: z.string().min(1).optional(),
+  soldTo: z.string().min(1).optional(),
+  soldPrice: z.number().nonnegative().optional(),
+  soldNotes: z.string().min(1).optional(),
+  notes: z.string().min(1).optional().describe("Homebox UI: Notes / Notatki."),
+  locationId: z.string().min(1).optional().describe("Homebox v0.25 location ID. New Entity API parentId is translated by this MCP client."),
+  parentId: z.string().min(1).optional().describe("New Entity API parent/location ID. Translated to locationId on legacy v0.25."),
+  tagIds: z.array(z.string().min(1)).optional().describe("Homebox tag IDs. Resolve names with homebox_resolve_tags first."),
+  fields: z.array(jsonObject).optional().describe("Custom fields. homebox_update_item preserves existing fields and merges by id/name."),
+  syncChildItemsLocations: z.boolean().optional(),
+  syncChildEntityLocations: z.boolean().optional(),
+};
+const itemCreateBody = z.object({ ...itemPayloadFields, name: z.string().min(1).describe("Item name.") }).passthrough();
+const itemPatchBody = z.object(itemPayloadFields).passthrough();
+
 const arrayDataOutput = { data: z.array(z.unknown()) };
 const apiSurfaceOutput = { surface: z.enum(["items", "entities"]), cached: z.boolean() };
 const publicSessionOutput = {
@@ -58,10 +130,24 @@ const itemWorkflowInput = {
   name: z.string().min(1),
   description: z.string().min(1).optional(),
   quantity: z.number().positive().optional(),
-  purchaseDate: z.string().min(1).optional(),
+  insured: z.boolean().optional(),
+  archived: z.boolean().optional(),
+  assetId: z.string().min(1).optional().describe("Homebox asset ID. Prefer custom fields for external order IDs unless overwriting assetId is intended."),
+  serialNumber: z.string().min(1).optional(),
+  modelNumber: z.string().min(1).optional().describe("Homebox UI: Model."),
+  manufacturer: z.string().min(1).optional().describe("Homebox UI: Manufacturer / Producent."),
+  lifetimeWarranty: z.boolean().optional(),
+  warrantyExpires: z.string().min(1).optional(),
+  warrantyDetails: z.string().min(1).optional(),
+  purchaseTime: z.string().min(1).optional().describe("Homebox UI: Purchase date / Data zakupu. Do not use purchaseDate."),
   purchasePrice: z.number().nonnegative().optional(),
   currency: z.string().min(1).optional(),
   purchaseFrom: z.string().min(1).optional(),
+  soldTime: z.string().min(1).optional(),
+  soldTo: z.string().min(1).optional(),
+  soldPrice: z.number().nonnegative().optional(),
+  soldNotes: z.string().min(1).optional(),
+  notes: z.string().min(1).optional().describe("Homebox UI: Notes / Notatki."),
   externalSource: z.string().min(1).optional(),
   externalAssetId: z.string().min(1).optional(),
   orderId: z.string().min(1).optional(),
@@ -271,7 +357,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     "homebox_list_items",
     {
       title: "List Homebox Items",
-      description: "List Homebox items with pagination and optional collection/group filter.",
+      description: "List Homebox items with pagination and optional collection/group filter. Prefer item tools when homebox_api_surface returns 'items' for Homebox v0.25. This MCP client auto-routes item tools to the newer entities surface when needed.",
       inputSchema: {
         ...authInput,
         page: z.number().int().positive().optional(),
@@ -292,7 +378,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     "homebox_get_item",
     {
       title: "Get Homebox Item",
-      description: "Get full Homebox item detail by ID.",
+      description: "Get full Homebox item detail by ID. Use this after create/update to verify important Homebox v0.25 fields such as purchaseTime, purchaseFrom, manufacturer, modelNumber and notes.",
       inputSchema: { ...authInput, itemId },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
@@ -303,8 +389,13 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     "homebox_create_item",
     {
       title: "Create Homebox Item",
-      description: "Create a Homebox item using /api/v1/items.",
-      inputSchema: { ...authInput, body: jsonObject.describe("Homebox item create payload.") },
+      description: [
+        "Low-level create via /api/v1/items or translated /api/v1/entities.",
+        "Required: body Homebox item create payload. For natural-language purchase/import workflows, prefer homebox_create_item_full or homebox_upsert_items_bulk.",
+        itemUiApiMapping,
+        legacyV025Notes,
+      ].join("\n\n"),
+      inputSchema: { ...authInput, body: itemCreateBody.describe("Homebox item create payload. Unknown Homebox fields are passed through.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.createItem(tokenFrom(args, state), args.body as JsonObject), "Item created"),
@@ -314,8 +405,14 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     "homebox_update_item",
     {
       title: "Update Homebox Item Safely",
-      description: "Update an item by GET-merge-PUT. Preserves fields/tags and converts location to locationId.",
-      inputSchema: { ...authInput, itemId, patch: jsonObject.describe("Partial fields to merge into current item.") },
+      description: [
+        "Update an item by reading current item, merging patch, and PUT-ing full payload. Preserves fields/tags and converts location to locationId.",
+        "Required: itemId Homebox item UUID; patch partial item fields to update.",
+        legacyItemPatchFields,
+        itemUiApiMapping,
+        legacyV025Notes,
+      ].join("\n\n"),
+      inputSchema: { ...authInput, itemId, patch: itemPatchBody.describe("Partial item fields to merge into current item. Use purchaseTime, not purchaseDate.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.updateItem(tokenFrom(args, state), args.itemId, args.patch as JsonObject), "Item updated"),
@@ -325,7 +422,11 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     "homebox_put_item",
     {
       title: "Replace Homebox Item",
-      description: "Direct PUT /api/v1/items/{id}. Caller must provide full Homebox payload; use homebox_update_item for safe partial updates.",
+      description: [
+        "Direct PUT /api/v1/items/{id}. Caller must provide full Homebox payload; use homebox_update_item for safe partial updates.",
+        "On Homebox v0.25, partial PUT can fail with server 500 and can drop fields/tags. Prefer homebox_update_item unless replacing the full object intentionally.",
+        itemUiApiMapping,
+      ].join("\n\n"),
       inputSchema: { ...authInput, itemId, body: jsonObject.describe("Full Homebox item payload.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -336,7 +437,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     "homebox_patch_item",
     {
       title: "Patch Homebox Item",
-      description: "PATCH /api/v1/items/{id}. Behavior depends on Homebox version.",
+      description: "Direct PATCH /api/v1/items/{id}. Behavior depends on Homebox version. For legacy Homebox v0.25 item updates, prefer homebox_update_item because it GET-merges and PUTs a safe full payload.",
       inputSchema: { ...authInput, itemId, patch: jsonObject },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -466,7 +567,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
     "homebox_list_entities",
     {
       title: "List Entities",
-      description: "Query entities via /api/v1/entities. Current Homebox docs describe this as GET /v1/entities.",
+      description: "Query entities via /api/v1/entities. Use entity tools when homebox_api_surface returns 'entities' for the new Entity Merge API. For Homebox v0.25 ('items' surface), prefer item tools: homebox_list_items, homebox_get_item, homebox_update_item, homebox_upload_attachment.",
       inputSchema: {
         ...authInput,
         q: z.string().min(1).optional().describe("Search string."),
@@ -489,7 +590,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
     "homebox_create_entity",
     {
       title: "Create Entity",
-      description: "Create an entity via POST /api/v1/entities.",
+      description: "Create an entity via POST /api/v1/entities. Use only for the newer Entity Merge API; for Homebox v0.25 items surface prefer homebox_create_item_full or homebox_create_item.",
       inputSchema: { ...authInput, body: jsonObject.describe("Entity create payload.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -569,7 +670,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
     "homebox_get_entity",
     {
       title: "Get Entity",
-      description: "Get entity detail via GET /api/v1/entities/{id}.",
+      description: "Get entity detail via GET /api/v1/entities/{id}. Use when homebox_api_surface returns 'entities'; for Homebox v0.25 use homebox_get_item.",
       inputSchema: { ...authInput, entityId },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
@@ -580,7 +681,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
     "homebox_put_entity",
     {
       title: "Replace Entity",
-      description: "Direct PUT /api/v1/entities/{id}. Caller must provide Homebox entity payload.",
+      description: "Direct PUT /api/v1/entities/{id}. Caller must provide Homebox entity payload. Use entity tools only on the newer entities surface; for Homebox v0.25 use item tools.",
       inputSchema: { ...authInput, entityId, body: jsonObject.describe("Entity update payload.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -591,7 +692,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
     "homebox_patch_entity",
     {
       title: "Patch Entity",
-      description: "PATCH /api/v1/entities/{id}. Current docs support entityTypeId, parentId, quantity and tagIds.",
+      description: "PATCH /api/v1/entities/{id}. Current docs support entityTypeId, parentId, quantity and tagIds. Use when homebox_api_surface returns 'entities'; for Homebox v0.25 use homebox_update_item.",
       inputSchema: { ...authInput, entityId, patch: jsonObject.describe("Entity patch payload.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -890,14 +991,14 @@ function registerAttachmentTools(server: McpServer, state: ToolState): void {
     "homebox_upload_attachment",
     {
       title: "Upload Attachment",
-      description: "Upload a base64 file as a Homebox item attachment.",
+      description: "Upload a base64 file as a Homebox item attachment. If primary=true and contentType is image/jpeg or image/png, Homebox sets it as the primary item photo and may generate its own thumbnail. Do not upload externally generated thumbnails as primary photos unless the user explicitly wants the small image. For user local files, direct file paths are not supported by this tool; pass base64 or use workflow photo tools with public imageUrl/photoUrl.",
       inputSchema: {
         ...authInput,
         itemId,
         fileName: z.string().min(1),
         base64: z.string().min(1).describe("Base64 file content."),
-        contentType: z.string().min(1).optional(),
-        primary: z.boolean().optional(),
+        contentType: z.string().min(1).optional().describe("MIME type. Use image/jpeg or image/png with primary=true for a primary item photo."),
+        primary: z.boolean().optional().describe("Set uploaded attachment as primary item photo when supported by Homebox."),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -946,24 +1047,43 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_resolve_tags",
     {
       title: "Resolve Tags",
-      description: "Resolve Homebox tag names into tagIds. Can optionally create missing tags via /api/v1/tags.",
+      description: "Resolve Homebox tag names into tagIds. Exact/case-sensitive names are preferred by Homebox; this tool dedupes and matches case-insensitively when needed. Can optionally create missing tags via /api/v1/tags.",
       inputSchema: {
         ...authInput,
-        labels: z.array(z.string().min(1)).default([]),
+        labels: z.array(z.string().min(1)).optional().default([]).describe("Tag names to resolve. Alias: names."),
+        names: z.array(z.string().min(1)).optional().describe("Alias for labels."),
         createMissing: z.boolean().optional().default(false),
         dryRun: z.boolean().optional().default(false),
       },
       outputSchema: tagResolutionOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    (args) => toolResult(() => resolveTags(state.homebox, tokenFrom(args, state), args), "Tags resolved"),
+    (args) => toolResult(() => resolveTags(state.homebox, tokenFrom(args, state), { labels: args.labels.length > 0 ? args.labels : args.names, createMissing: args.createMissing, dryRun: args.dryRun }), "Tags resolved"),
+  );
+
+  server.registerTool(
+    "homebox_resolve_location",
+    {
+      title: "Resolve Location",
+      description: "Resolve a Homebox location name/path into locationId. Defaults to createMissing=false for lookup-only workflows. Use homebox_find_or_create_location when missing path segments should be created by default.",
+      inputSchema: {
+        ...authInput,
+        name: z.string().min(1).describe("Location name or path like Garage/Shelf."),
+        parentId: z.string().min(1).optional(),
+        createMissing: z.boolean().optional().default(false),
+        dryRun: z.boolean().optional().default(false),
+      },
+      outputSchema: locationResolutionOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => findOrCreateLocation(state.homebox, tokenFrom(args, state), { locationName: args.name, parentId: args.parentId, createMissing: args.createMissing, dryRun: args.dryRun }), "Location resolved"),
   );
 
   server.registerTool(
     "homebox_find_or_create_location",
     {
       title: "Find Or Create Location",
-      description: "Find a Homebox location by name/path and optionally create missing path segments.",
+      description: "Find a Homebox location by name/path and optionally create missing path segments. Defaults to createMissing=true. Use homebox_resolve_location for lookup-only resolution.",
       inputSchema: {
         ...authInput,
         locationName: z.string().min(1).describe("Location name or path like Garage/Shelf."),
@@ -981,7 +1101,13 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_create_item_full",
     {
       title: "Create Item Full",
-      description: "Workflow create: resolves tags/location, stores external refs as custom fields, creates item, then optionally uploads a primary photo from a public URL.",
+      description: [
+        "Workflow create: resolves tags/location, stores external refs as custom fields, creates item, then optionally uploads a primary photo from a public URL.",
+        "Accepted item fields include name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. Local photo paths are not supported.",
+        itemUiApiMapping,
+        legacyV025Notes,
+        purchaseImportWorkflow,
+      ].join("\n\n"),
       inputSchema: { ...authInput, ...itemWorkflowInput },
       outputSchema: createItemFullOutput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -993,7 +1119,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_upload_primary_photo_from_file",
     {
       title: "Upload Primary Photo",
-      description: "Upload and set a primary photo. Prefer imageUrl/photoUrl public URLs; base64 is fallback. Local file paths are not supported.",
+      description: "Upload and set a primary item photo. Prefer imageUrl/photoUrl public URLs; base64 is fallback. Local file paths are not supported. Use full-size product photo, not an externally generated thumbnail, unless the user explicitly wants the small image.",
       inputSchema: {
         ...authInput,
         itemId,
@@ -1017,7 +1143,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_replace_primary_photo",
     {
       title: "Replace Primary Photo",
-      description: "Upload a new primary photo from public URL/base64. Existing primary attachments are only deleted when deletePreviousPrimary=true.",
+      description: "Upload a new primary item photo from public URL/base64. Existing primary attachments are only deleted when deletePreviousPrimary=true. Local file paths are not supported; use full-size product photo instead of externally generated thumbnail unless explicitly requested.",
       inputSchema: {
         ...authInput,
         itemId,
@@ -1042,7 +1168,12 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_upsert_items_bulk",
     {
       title: "Bulk Upsert Items",
-      description: "Create/update many items. Dedupe defaults to External Asset ID, Order ID, then name. Supports dryRun and public photo URLs.",
+      description: [
+        "Create/update many purchase/import items in one call. Dedupe defaults to External Asset ID, Order ID, then name. Resolves location/tags, stores external refs as custom fields, uploads public photo URLs, and returns a report.",
+        "Each item accepts name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. Local photo paths are not supported.",
+        itemUiApiMapping,
+        legacyV025Notes,
+      ].join("\n\n"),
       inputSchema: {
         ...authInput,
         locationId: locationId.optional(),
@@ -1057,6 +1188,32 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => upsertItemsBulk(state.homebox, tokenFrom(args, state), args as BulkUpsertInput), "Bulk upsert completed"),
+  );
+
+  server.registerTool(
+    "homebox_import_items_bulk",
+    {
+      title: "Import Items Bulk",
+      description: [
+        "Import many purchase items in one call, optimized for sources such as AliExpress orders. Alias for homebox_upsert_items_bulk; prefer this over manual orchestration.",
+        "Each item accepts name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. Local photo paths are not supported.",
+        itemUiApiMapping,
+        legacyV025Notes,
+      ].join("\n\n"),
+      inputSchema: {
+        ...authInput,
+        locationId: locationId.optional(),
+        locationName: z.string().min(1).optional(),
+        createMissingTags: z.boolean().optional().default(false),
+        createMissingLocation: z.boolean().optional().default(true),
+        dedupeBy: z.array(z.enum(["externalAssetId", "orderId", "name"])).min(1).optional(),
+        dryRun: z.boolean().optional().default(false),
+        items: z.array(z.object(itemWorkflowInput)).min(1),
+      },
+      outputSchema: bulkUpsertOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => upsertItemsBulk(state.homebox, tokenFrom(args, state), args as BulkUpsertInput), "Bulk import completed"),
   );
 }
 
@@ -1147,7 +1304,7 @@ function registerGenericRequestTool(server: McpServer, state: ToolState): void {
     "homebox_api_request",
     {
       title: "Homebox API Request",
-      description: "Call a relative /api/v1/... endpoint on the configured Homebox instance. Use for version-specific API coverage.",
+      description: "Low-level escape hatch. Prefer typed tools. Use only when a typed tool does not expose the required endpoint or field. Caller is responsible for full Homebox payload compatibility. Only relative /api/v1/... paths on the configured Homebox instance are allowed; absolute URLs are rejected.",
       inputSchema: {
         ...authInput,
         method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).default("GET"),
