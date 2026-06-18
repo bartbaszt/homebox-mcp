@@ -181,6 +181,15 @@ Use full-size product images for primary photos. Do not upload externally genera
 
 `homebox_upload_attachment` uploads base64 files as regular item attachments. If `primary=true` and `contentType` is `image/jpeg` or `image/png`, Homebox sets it as the primary item photo and may generate its own thumbnail.
 
+Photo tools:
+
+- `homebox_ensure_primary_photo` (preferred for agents): idempotent. Reuses an existing photo attachment by title or content hash; only uploads a new one when no match exists. Pass `cleanupDuplicates=true` to also remove other duplicate photos.
+- `homebox_replace_primary_photo`: uploads a new primary photo and deletes the previous primary by default. Use when you want a fresh attachment and removal of the old one.
+- `homebox_upload_primary_photo_from_file`: always adds a new attachment. Does NOT replace or dedupe. Repeated calls produce duplicates — prefer `ensure_primary_photo` for set-primary operations.
+- `homebox_cleanup_duplicate_photos`: removes duplicate photo attachments, keeping one per title+mimeType group (prefers the current primary).
+
+`homebox_create_item_full` and `homebox_upsert_items_bulk` use the idempotent ensure path internally, so retries and duplicate workflow calls will not create duplicate photo attachments.
+
 ## Low-Level API Requests
 
 `homebox_api_request` is a low-level escape hatch. Prefer typed tools.

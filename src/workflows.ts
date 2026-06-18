@@ -6,6 +6,8 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
+import { createHash } from "node:crypto";
+
 import type { HomeboxClient, JsonObject, PublicUrlFile } from "./homebox-client.js";
 import { mergeEntityForPut } from "./homebox-client.js";
 import { HomeboxMcpError, toSafeError } from "./errors.js";
@@ -117,12 +119,13 @@ export interface PhotoUploadInput {
 export interface PhotoUploadResult {
   itemId: string;
   primary: true;
-  source: "url" | "base64";
+  source: "url" | "base64" | "existing";
   url?: string;
   fileName?: string;
   contentType?: string;
   contentLength?: number;
   attachment: unknown;
+  warnings?: string[];
 }
 
 export interface ReplacePrimaryPhotoInput extends PhotoUploadInput {
@@ -132,6 +135,24 @@ export interface ReplacePrimaryPhotoInput extends PhotoUploadInput {
 export interface ReplacePrimaryPhotoResult extends PhotoUploadResult {
   previousPrimaryAttachmentIds: string[];
   deletedPreviousPrimaryIds: string[];
+}
+
+export interface EnsurePrimaryPhotoInput extends PhotoUploadInput {
+  dedupe?: boolean;
+  cleanupDuplicates?: boolean;
+}
+
+export interface EnsurePrimaryPhotoResult extends PhotoUploadResult {
+  reused: boolean;
+  primaryAttachmentId?: string;
+}
+
+export interface CleanupDuplicatePhotosResult {
+  itemId: string;
+  keptPrimaryAttachmentId?: string;
+  deletedAttachmentIds: string[];
+  duplicateGroups: number;
+  warnings: string[];
 }
 
 export interface BulkUpsertInput {
@@ -265,7 +286,7 @@ export async function createItemFull(client: HomeboxClient, token: string, input
   const item = await createEntityWithExtras(client, token, prepared.payload);
   const itemId = readId(toRecord(item));
   const photo = itemId && input.photoUrl && input.photoIsPrimary !== false
-    ? await uploadPrimaryPhoto(client, token, { itemId, imageUrl: input.photoUrl, fileName: input.photoFileName, contentType: input.photoContentType })
+    ? await ensurePrimaryPhoto(client, token, { itemId, imageUrl: input.photoUrl, fileName: input.photoFileName, contentType: input.photoContentType })
     : undefined;
 
   return { ...prepared, dryRun: false, itemId, item, photo };
@@ -294,27 +315,33 @@ function splitCreatePayload(payload: JsonObject): { core: JsonObject; extra: Jso
 }
 
 export async function uploadPrimaryPhoto(client: HomeboxClient, token: string, input: PhotoUploadInput): Promise<PhotoUploadResult> {
+  const warnings: string[] = [];
+  const attachments = asRecords(await client.listAttachments(token, input.itemId));
+  const photoCount = attachments.filter(isPhotoAttachment).length;
+  if (photoCount >= 3) warnings.push(`item already has ${photoCount} photo attachments; consider homebox_cleanup_duplicate_photos or homebox_ensure_primary_photo to avoid duplicates`);
+
   if (input.imageUrl) {
     const file = await client.fetchPublicUrlFile(input.imageUrl, input.fileName, input.contentType);
     assertImage(file);
     const attachment = await client.uploadAttachment({ token, itemId: input.itemId, fileName: file.fileName, base64: file.base64, contentType: file.contentType, primary: true });
-    return { itemId: input.itemId, primary: true, source: "url", url: file.url, fileName: file.fileName, contentType: file.contentType, contentLength: file.contentLength, attachment };
+    return { itemId: input.itemId, primary: true, source: "url", url: file.url, fileName: file.fileName, contentType: file.contentType, contentLength: file.contentLength, attachment, warnings };
   }
 
   if (!input.base64 || !input.fileName) throw new HomeboxMcpError("validation", "Provide imageUrl, or base64 with fileName. Local file paths are not supported.");
   assertImage({ contentType: input.contentType, fileName: input.fileName } as PublicUrlFile);
   const attachment = await client.uploadAttachment({ token, itemId: input.itemId, fileName: input.fileName, base64: input.base64, contentType: input.contentType, primary: true });
-  return { itemId: input.itemId, primary: true, source: "base64", fileName: input.fileName, contentType: input.contentType, attachment };
+  return { itemId: input.itemId, primary: true, source: "base64", fileName: input.fileName, contentType: input.contentType, attachment, warnings };
 }
 
 export async function replacePrimaryPhoto(client: HomeboxClient, token: string, input: ReplacePrimaryPhotoInput): Promise<ReplacePrimaryPhotoResult> {
+  const deletePrevious = input.deletePreviousPrimary !== false;
   const attachments = asRecords(await client.listAttachments(token, input.itemId));
   const previousPrimaryAttachmentIds = attachments.filter(isPrimaryAttachment).map(readId).filter((id): id is string => Boolean(id));
-  const uploaded = await uploadPrimaryPhoto(client, token, input);
+  const uploaded = await uploadPrimaryPhoto(client, token, { ...input });
   const uploadedId = readId(toRecord(uploaded.attachment));
   const deletedPreviousPrimaryIds: string[] = [];
 
-  if (input.deletePreviousPrimary) {
+  if (deletePrevious) {
     for (const id of previousPrimaryAttachmentIds) {
       if (id === uploadedId) continue;
       await client.deleteAttachment(token, input.itemId, id);
@@ -323,6 +350,114 @@ export async function replacePrimaryPhoto(client: HomeboxClient, token: string, 
   }
 
   return { ...uploaded, previousPrimaryAttachmentIds, deletedPreviousPrimaryIds };
+}
+
+export async function ensurePrimaryPhoto(client: HomeboxClient, token: string, input: EnsurePrimaryPhotoInput): Promise<EnsurePrimaryPhotoResult> {
+  const dedupe = input.dedupe !== false;
+  const attachments = asRecords(await client.listAttachments(token, input.itemId));
+  const warnings: string[] = [];
+
+  let resolvedFile: { fileName: string; contentType?: string; base64: string; contentLength?: number; url?: string };
+  if (input.imageUrl) {
+    const file = await client.fetchPublicUrlFile(input.imageUrl, input.fileName, input.contentType);
+    assertImage(file);
+    resolvedFile = { fileName: file.fileName, contentType: file.contentType, base64: file.base64, contentLength: file.contentLength, url: file.url };
+  } else if (input.base64 && input.fileName) {
+    assertImage({ contentType: input.contentType, fileName: input.fileName } as PublicUrlFile);
+    resolvedFile = { fileName: input.fileName, contentType: input.contentType, base64: input.base64 };
+  } else {
+    throw new HomeboxMcpError("validation", "Provide imageUrl, or base64 with fileName. Local file paths are not supported.");
+  }
+
+  const incomingHash = sha256Hex(resolvedFile.base64);
+  let existingId: string | undefined;
+  if (dedupe) {
+    for (const att of attachments) {
+      if (!isPhotoAttachment(att)) continue;
+      const title = readString(att.title);
+      const matchedByTitle = title && title === resolvedFile.fileName;
+      if (matchedByTitle) {
+        existingId = readId(att);
+        warnings.push(`reused existing attachment by title: ${title}`);
+        break;
+      }
+    }
+    if (!existingId) {
+      for (const att of attachments) {
+        if (!isPhotoAttachment(att)) continue;
+        const attId = readId(att);
+        if (!attId) continue;
+        const downloaded = await client.downloadAttachment(token, input.itemId, attId).catch(() => undefined);
+        const dlBase64 = (downloaded as { base64?: string } | undefined)?.base64;
+        if (!dlBase64) continue;
+        if (sha256Hex(dlBase64) === incomingHash) {
+          existingId = attId;
+          warnings.push(`reused existing attachment by content hash: ${att.title ?? attId}`);
+          break;
+        }
+      }
+    }
+  }
+
+  let resultAttachment: unknown;
+  let primaryAttachmentId: string | undefined;
+  if (existingId) {
+    await client.updateEntityAttachment(token, input.itemId, existingId, { primary: true, type: "photo" });
+    resultAttachment = attachments.find((a) => readId(a) === existingId);
+    primaryAttachmentId = existingId;
+    if (input.cleanupDuplicates) await cleanupDuplicatePhotos(client, token, { itemId: input.itemId });
+    return { itemId: input.itemId, primary: true, source: "existing", url: resolvedFile.url, fileName: resolvedFile.fileName, contentType: resolvedFile.contentType, contentLength: resolvedFile.contentLength, attachment: resultAttachment, warnings, reused: true, primaryAttachmentId };
+  }
+
+  const attachment = await client.uploadAttachment({ token, itemId: input.itemId, fileName: resolvedFile.fileName, base64: resolvedFile.base64, contentType: resolvedFile.contentType, primary: true });
+  resultAttachment = attachment;
+  primaryAttachmentId = readId(toRecord(attachment));
+  if (input.cleanupDuplicates) await cleanupDuplicatePhotos(client, token, { itemId: input.itemId });
+  return { itemId: input.itemId, primary: true, source: input.imageUrl ? "url" : "base64", url: resolvedFile.url, fileName: resolvedFile.fileName, contentType: resolvedFile.contentType, contentLength: resolvedFile.contentLength, attachment: resultAttachment, warnings, reused: false, primaryAttachmentId };
+}
+
+export async function cleanupDuplicatePhotos(client: HomeboxClient, token: string, input: { itemId: string; keepPrimary?: boolean }): Promise<CleanupDuplicatePhotosResult> {
+  const keepPrimary = input.keepPrimary !== false;
+  const attachments = asRecords(await client.listAttachments(token, input.itemId));
+  const photos = attachments.filter(isPhotoAttachment);
+  const warnings: string[] = [];
+  const deletedAttachmentIds: string[] = [];
+
+  const groups = new Map<string, Array<{ id?: string; title?: string }>>();
+  for (const att of photos) {
+    const id = readId(att);
+    const title = readString(att.title);
+    const key = `${title ?? ""}|${readString(att.mimeType) ?? ""}`;
+    const list = groups.get(key) ?? [];
+    list.push({ id, title });
+    groups.set(key, list);
+  }
+
+  let duplicateGroups = 0;
+  for (const [, list] of groups) {
+    if (list.length < 2) continue;
+    duplicateGroups += 1;
+    const primaryIds = photos.filter((p) => isPrimaryAttachment(p)).map(readId).filter((id): id is string => Boolean(id));
+    const sorted = [...list].sort((a, b) => {
+      const aPrimary = primaryIds.includes(a.id ?? "");
+      const bPrimary = primaryIds.includes(b.id ?? "");
+      if (aPrimary && !bPrimary) return -1;
+      if (!aPrimary && bPrimary) return 1;
+      return 0;
+    });
+    const keeper = sorted[0];
+    for (const entry of sorted.slice(keepPrimary ? 1 : 0)) {
+      if (!entry.id) continue;
+      if (keepPrimary && primaryIds.includes(entry.id) && entry.id === keeper.id) continue;
+      await client.deleteAttachment(token, input.itemId, entry.id);
+      deletedAttachmentIds.push(entry.id);
+    }
+  }
+  if (duplicateGroups > 0) warnings.push(`found ${duplicateGroups} duplicate photo group(s); deleted ${deletedAttachmentIds.length} duplicate attachment(s)`);
+  const keptPrimary = photos.find(isPrimaryAttachment);
+  const keptPrimaryAttachmentId = keptPrimary ? readId(keptPrimary) : undefined;
+
+  return { itemId: input.itemId, keptPrimaryAttachmentId, deletedAttachmentIds, duplicateGroups, warnings };
 }
 
 export async function upsertItemsBulk(client: HomeboxClient, token: string, input: BulkUpsertInput): Promise<BulkUpsertResult> {
@@ -350,14 +485,14 @@ export async function upsertItemsBulk(client: HomeboxClient, token: string, inpu
       if (existing) {
         const updated = await client.updateItem(token, existing.itemId, prepared.payload);
         const photo = fullItem.photoUrl && fullItem.photoIsPrimary !== false
-          ? await uploadPrimaryPhoto(client, token, { itemId: existing.itemId, imageUrl: fullItem.photoUrl, fileName: fullItem.photoFileName, contentType: fullItem.photoContentType })
+          ? await ensurePrimaryPhoto(client, token, { itemId: existing.itemId, imageUrl: fullItem.photoUrl, fileName: fullItem.photoFileName, contentType: fullItem.photoContentType })
           : undefined;
         result.updated.push({ index, itemId: existing.itemId, matchedBy: existing.matchedBy, item: updated, photo });
       } else {
         const item = await createEntityWithExtras(client, token, prepared.payload);
         const itemId = readId(toRecord(item));
         const photo = itemId && fullItem.photoUrl && fullItem.photoIsPrimary !== false
-          ? await uploadPrimaryPhoto(client, token, { itemId, imageUrl: fullItem.photoUrl, fileName: fullItem.photoFileName, contentType: fullItem.photoContentType })
+          ? await ensurePrimaryPhoto(client, token, { itemId, imageUrl: fullItem.photoUrl, fileName: fullItem.photoFileName, contentType: fullItem.photoContentType })
           : undefined;
         result.created.push({ index, itemId, item, photo });
       }
@@ -493,6 +628,16 @@ function assertImage(file: PublicUrlFile): void {
 
 function isPrimaryAttachment(attachment: JsonObject): boolean {
   return attachment.primary === true || attachment.isPrimary === true;
+}
+
+function isPhotoAttachment(attachment: JsonObject): boolean {
+  const type = readString(attachment.type);
+  const mimeType = readString(attachment.mimeType);
+  return type === "photo" || Boolean(mimeType?.startsWith("image/"));
+}
+
+function sha256Hex(base64: string): string {
+  return createHash("sha256").update(Buffer.from(base64, "base64")).digest("hex");
 }
 
 function sameParent(location: JsonObject, parentId?: string): boolean {

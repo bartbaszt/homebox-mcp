@@ -14,7 +14,7 @@ import { z } from "zod";
 import type { HomeboxClient, JsonObject, QueryValue } from "./homebox-client.js";
 import type { HomeboxSession, SessionStore } from "./session-store.js";
 import { HomeboxMcpError, toSafeError } from "./errors.js";
-import { createItemFull, findOrCreateLocation, replacePrimaryPhoto, resolveTags, uploadPrimaryPhoto, upsertItemsBulk, type BulkUpsertInput, type ItemWorkflowInput } from "./workflows.js";
+import { cleanupDuplicatePhotos, createItemFull, ensurePrimaryPhoto, findOrCreateLocation, replacePrimaryPhoto, resolveTags, uploadPrimaryPhoto, upsertItemsBulk, type BulkUpsertInput, type ItemWorkflowInput } from "./workflows.js";
 
 export interface ToolState {
   homebox: HomeboxClient;
@@ -196,17 +196,30 @@ const locationResolutionOutput = {
 const photoUploadOutput = {
   itemId: z.string(),
   primary: z.literal(true),
-  source: z.enum(["url", "base64"]),
+  source: z.enum(["url", "base64", "existing"]),
   url: z.string().optional(),
   fileName: z.string().optional(),
   contentType: z.string().optional(),
   contentLength: z.number().int().nonnegative().optional(),
   attachment: z.unknown().optional(),
+  warnings: z.array(z.string()).optional(),
 };
 const replacePhotoOutput = {
   ...photoUploadOutput,
   previousPrimaryAttachmentIds: z.array(z.string()),
   deletedPreviousPrimaryIds: z.array(z.string()),
+};
+const ensurePrimaryPhotoOutput = {
+  ...photoUploadOutput,
+  reused: z.boolean(),
+  primaryAttachmentId: z.string().optional(),
+};
+const cleanupDuplicatePhotosOutput = {
+  itemId: z.string(),
+  keptPrimaryAttachmentId: z.string().optional(),
+  deletedAttachmentIds: z.array(z.string()),
+  duplicateGroups: z.number(),
+  warnings: z.array(z.string()),
 };
 const createItemFullOutput = {
   dryRun: z.boolean(),
@@ -1118,7 +1131,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_upload_primary_photo_from_file",
     {
       title: "Upload Primary Photo",
-      description: "Upload and set a primary item photo from a direct image file URL or base64. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... URLs — those belong in sourceUrls/notes, not as photoUrl. Local file paths are not supported. Use full-size product photo, not an externally generated thumbnail, unless the user explicitly wants the small image.",
+      description: "Upload a new attachment and set it as the primary item photo from a direct image file URL or base64. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... URLs — those belong in sourceUrls/notes, not as photoUrl. Local file paths are not supported. Use full-size product photo, not an externally generated thumbnail, unless the user explicitly wants the small image. IMPORTANT: this tool ALWAYS adds a new attachment — it does NOT replace existing primary photos. Repeated calls produce duplicate photo attachments. For idempotent set-primary use homebox_ensure_primary_photo. For replace-then-cleanup use homebox_replace_primary_photo (default deletes previous primary).",
       inputSchema: {
         ...authInput,
         itemId,
@@ -1142,7 +1155,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_replace_primary_photo",
     {
       title: "Replace Primary Photo",
-      description: "Upload a new primary item photo from a direct image file URL or base64. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... — store product page URLs in sourceUrls/notes instead. Existing primary attachments are deleted only when deletePreviousPrimary=true. Use a full-size product image, not a generated thumbnail, unless explicitly requested.",
+      description: "Upload a new primary item photo and delete the previous primary attachment by default. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... — store product page URLs in sourceUrls/notes instead. deletePreviousPrimary defaults to true (safer for agents); set to false to keep old primary as a regular attachment. For idempotent dedupe-by-URL/title/hash prefer homebox_ensure_primary_photo. Use a full-size product image, not a generated thumbnail, unless explicitly requested.",
       inputSchema: {
         ...authInput,
         itemId,
@@ -1151,7 +1164,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
         fileName: z.string().min(1).optional(),
         base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
         contentType: z.string().min(1).optional(),
-        deletePreviousPrimary: z.boolean().optional().default(false),
+        deletePreviousPrimary: z.boolean().optional().default(true),
       },
       outputSchema: replacePhotoOutput,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -1160,6 +1173,52 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
       toolResult(
         () => replacePrimaryPhoto(state.homebox, tokenFrom(args, state), { itemId: args.itemId, imageUrl: args.imageUrl ?? args.photoUrl, fileName: args.fileName, base64: args.base64, contentType: args.contentType, deletePreviousPrimary: args.deletePreviousPrimary }),
         "Primary photo replaced",
+      ),
+  );
+
+  server.registerTool(
+    "homebox_ensure_primary_photo",
+    {
+      title: "Ensure Primary Photo",
+      description: "Idempotent primary photo setter. Fetches existing attachments first and reuses an existing photo attachment when one matches by title (fileName) or content hash — only updates its primary flag. When no match exists, uploads the new photo and sets it primary. Avoids duplicate attachments from repeated agent calls. Pass cleanupDuplicates=true to also remove other duplicate photo attachments after setting primary. imageUrl/photoUrl must be a direct image file URL (image/jpeg, image/png or image/webp), not a product page. Local file paths are not supported.",
+      inputSchema: {
+        ...authInput,
+        itemId,
+        imageUrl,
+        photoUrl: imageUrl.describe("Alias for imageUrl. Must be a direct image file URL, not a product page."),
+        fileName: z.string().min(1).optional(),
+        base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
+        contentType: z.string().min(1).optional(),
+        dedupe: z.boolean().optional().default(true).describe("When true (default), reuse existing attachment by title or content hash instead of uploading again."),
+        cleanupDuplicates: z.boolean().optional().default(false).describe("When true, also run homebox_cleanup_duplicate_photos after setting primary."),
+      },
+      outputSchema: ensurePrimaryPhotoOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) =>
+      toolResult(
+        () => ensurePrimaryPhoto(state.homebox, tokenFrom(args, state), { itemId: args.itemId, imageUrl: args.imageUrl ?? args.photoUrl, fileName: args.fileName, base64: args.base64, contentType: args.contentType, dedupe: args.dedupe, cleanupDuplicates: args.cleanupDuplicates }),
+        "Primary photo ensured",
+      ),
+  );
+
+  server.registerTool(
+    "homebox_cleanup_duplicate_photos",
+    {
+      title: "Cleanup Duplicate Photos",
+      description: "Remove duplicate photo attachments for an entity. Groups photos by title+mimeType and keeps one per group (preferring the current primary). Useful after repeated homebox_upload_primary_photo_from_file calls. keepPrimary defaults to true; set to false to remove all but the primary across all duplicate groups.",
+      inputSchema: {
+        ...authInput,
+        itemId,
+        keepPrimary: z.boolean().optional().default(true).describe("Keep the current primary attachment even if its group has duplicates."),
+      },
+      outputSchema: cleanupDuplicatePhotosOutput,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) =>
+      toolResult(
+        () => cleanupDuplicatePhotos(state.homebox, tokenFrom(args, state), { itemId: args.itemId, keepPrimary: args.keepPrimary }),
+        "Duplicate photos cleaned up",
       ),
   );
 

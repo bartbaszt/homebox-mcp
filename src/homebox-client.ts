@@ -567,7 +567,7 @@ export class HomeboxClient {
   }
 
   async setPrimaryAttachment(token: string, itemId: string, attachmentId: string): Promise<unknown> {
-    return this.updateEntityAttachment(token, itemId, attachmentId, { primary: true });
+    return this.updateEntityAttachment(token, itemId, attachmentId, { primary: true, type: "photo" });
   }
 
   async fetchPublicUrlFile(url: string, fileName?: string, contentType?: string): Promise<PublicUrlFile> {

@@ -379,7 +379,7 @@ describe("Homebox client", () => {
         return json(res, 200, { id: "entity-1", attachments: [{ id: "att-1" }] });
       }
       if (req.method === "PUT" && req.path === "/api/v1/entities/entity-1/attachments/att-1") {
-        expect(req.body).toMatchObject({ primary: true });
+        expect(req.body).toMatchObject({ primary: true, type: "photo" });
         return json(res, 200, req.body);
       }
       json(res, 404, { error: `${req.method} ${req.path}` });

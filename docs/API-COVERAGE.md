@@ -133,10 +133,12 @@ Use `purchaseTime` (alias) or `purchaseDate` for the purchase date; workflows em
 - `homebox_resolve_tags`: resolves tag names from `labels` or `names`; exact match first, then case-insensitive match; optional creation via `POST /api/v1/tags`.
 - `homebox_resolve_location`: lookup-focused location name/path resolver. Defaults to `createMissing=false`.
 - `homebox_find_or_create_location`: location name/path resolver that creates missing path segments by default. Locations are entities with `isLocation=true`.
-- `homebox_create_item_full`: resolves tags/location, stores external refs as custom fields, creates entity, optionally uploads a primary photo from public URL/base64.
-- `homebox_upload_primary_photo_from_file`: uploads and sets a primary entity photo. Public `imageUrl`/`photoUrl` preferred; base64 fallback; local paths unsupported.
-- `homebox_replace_primary_photo`: uploads a new primary entity photo and optionally deletes previous primary attachments.
-- `homebox_upsert_items_bulk`: creates or updates many entities; dedupe defaults to `externalAssetId`, `orderId`, then `name`.
+- `homebox_create_item_full`: resolves tags/location, stores external refs as custom fields, creates entity, optionally uploads a primary photo from public URL/base64. Photo upload uses the idempotent ensure path (reuses existing attachment by title or content hash) so retries do not create duplicate photos.
+- `homebox_upload_primary_photo_from_file`: uploads a new attachment and sets it as the primary entity photo. Always adds a new attachment — does NOT replace existing primary. Public `imageUrl`/`photoUrl` preferred; base64 fallback; local paths unsupported. Use `homebox_ensure_primary_photo` for idempotent set-primary, `homebox_replace_primary_photo` to delete previous primary.
+- `homebox_replace_primary_photo`: uploads a new primary entity photo and deletes previous primary attachments by default (`deletePreviousPrimary` defaults to `true`).
+- `homebox_ensure_primary_photo`: idempotent primary photo setter. Reuses an existing photo attachment by title (fileName) or content hash and only updates its primary flag; uploads a new attachment only when no match exists. Optional `cleanupDuplicates` removes other duplicate photo attachments.
+- `homebox_cleanup_duplicate_photos`: removes duplicate photo attachments for an entity, grouping by title+mimeType and keeping one per group (preferring the current primary).
+- `homebox_upsert_items_bulk`: creates or updates many entities; dedupe defaults to `externalAssetId`, `orderId`, then `name`. Photo uploads use the idempotent ensure path.
 - `homebox_import_items_bulk`: import-oriented alias for bulk upsert, useful for sources such as AliExpress orders.
 
 Workflow entity fields include `name`, `description`, `quantity`, `purchaseTime`, `purchaseFrom`, `purchasePrice`, `manufacturer`, `modelNumber`, `serialNumber`, `notes`, `labels`, `externalAssetId`, `orderId`, `sourceUrls`, `photoUrl` and `parentId` (via `locationId`/`locationName`).
