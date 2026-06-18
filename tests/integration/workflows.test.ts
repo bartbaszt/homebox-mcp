@@ -30,12 +30,14 @@ describe("Homebox workflows", () => {
     expect(result.unresolved).toEqual([]);
   });
 
-  it("finds existing location path segments and creates missing legacy locations", async () => {
+  it("finds existing location path segments and creates missing location entities", async () => {
     mock = await startMockHomebox((req, res) => {
-      if (req.method === "GET" && req.path === "/api/v1/entities") return json(res, 404, { error: "not found" });
-      if (req.method === "GET" && req.path === "/api/v1/locations") return json(res, 200, [{ id: "loc-garage", name: "Garage" }]);
-      if (req.method === "POST" && req.path === "/api/v1/locations") {
-        expect(req.body).toEqual({ name: "Shelf", parentId: "loc-garage" });
+      if (req.method === "GET" && req.path === "/api/v1/entities") {
+        expect(req.query.get("isLocation")).toBe("true");
+        return json(res, 200, [{ id: "loc-garage", name: "Garage", parentId: undefined }]);
+      }
+      if (req.method === "POST" && req.path === "/api/v1/entities") {
+        expect(req.body).toMatchObject({ name: "Shelf", isLocation: true, parentId: "loc-garage" });
         return json(res, 201, { id: "loc-shelf", name: "Shelf", parentId: "loc-garage" });
       }
       json(res, 404, { error: `${req.method} ${req.path}` });
@@ -49,12 +51,14 @@ describe("Homebox workflows", () => {
     expect(result.path).toEqual(["Garage", "Shelf"]);
   });
 
-  it("creates full legacy items with resolved tags, location, and external ref fields", async () => {
+  it("creates full entities with resolved tags, location and external ref fields", async () => {
     mock = await startMockHomebox((req, res) => {
-      if (req.method === "GET" && req.path === "/api/v1/entities") return json(res, 404, { error: "not found" });
       if (req.method === "GET" && req.path === "/api/v1/tags") return json(res, 200, [{ id: "tag-1", name: "Tool" }]);
-      if (req.method === "GET" && req.path === "/api/v1/locations") return json(res, 200, [{ id: "loc-1", name: "Garage" }]);
-      if (req.method === "POST" && req.path === "/api/v1/items") {
+      if (req.method === "GET" && req.path === "/api/v1/entities") {
+        expect(req.query.get("isLocation")).toBe("true");
+        return json(res, 200, [{ id: "loc-1", name: "Garage" }]);
+      }
+      if (req.method === "POST" && req.path === "/api/v1/entities") {
         expect(req.body).toMatchObject({
           name: "Drill",
           description: "Cordless",
@@ -64,18 +68,17 @@ describe("Homebox workflows", () => {
           manufacturer: "Acme",
           modelNumber: "D-42",
           notes: "Imported order",
-          locationId: "loc-1",
+          parentId: "loc-1",
           tagIds: ["tag-1"],
         });
         expect(req.body).not.toHaveProperty("purchaseDate");
-        const body = req.body as { parentId?: unknown; fields?: Array<{ name: string; textValue: string }> };
-        expect(body.parentId).toBeUndefined();
+        const body = req.body as { fields?: Array<{ name: string; textValue: string }> };
         expect(body.fields).toEqual([
           { name: "External Asset ID", textValue: "asset-1" },
           { name: "Order ID", textValue: "order-1" },
           { name: "Source URL", textValue: "https://example.com/order/1" },
         ]);
-        return json(res, 201, { id: "item-1", name: "Drill" });
+        return json(res, 201, { id: "entity-1", name: "Drill" });
       }
       json(res, 404, { error: `${req.method} ${req.path}` });
     });
@@ -97,22 +100,21 @@ describe("Homebox workflows", () => {
       sourceUrls: ["https://example.com/order/1"],
     });
 
-    expect(result.itemId).toBe("item-1");
+    expect(result.itemId).toBe("entity-1");
     expect(result.tags.resolved).toHaveLength(1);
     expect(result.location?.locationId).toBe("loc-1");
   });
 
-  it("bulk-upserts by external asset id using safe legacy update", async () => {
+  it("bulk-upserts by external asset id using safe GET-merge-PUT", async () => {
     mock = await startMockHomebox((req, res) => {
-      if (req.method === "GET" && req.path === "/api/v1/entities") return json(res, 404, { error: "not found" });
-      if (req.method === "GET" && req.path === "/api/v1/items" && req.query.get("q") === "asset-1") {
-        return json(res, 200, { items: [{ id: "item-1", name: "Old", fields: [{ name: "External Asset ID", textValue: "asset-1" }] }] });
+      if (req.method === "GET" && req.path === "/api/v1/entities" && req.query.get("q") === "asset-1") {
+        return json(res, 200, { items: [{ id: "entity-1", name: "Old", fields: [{ name: "External Asset ID", textValue: "asset-1" }] }] });
       }
-      if (req.method === "GET" && req.path === "/api/v1/items/item-1") {
-        return json(res, 200, { id: "item-1", name: "Old", fields: [{ name: "External Asset ID", textValue: "asset-1" }], location: { id: "loc-1" } });
+      if (req.method === "GET" && req.path === "/api/v1/entities/entity-1") {
+        return json(res, 200, { id: "entity-1", name: "Old", fields: [{ name: "External Asset ID", textValue: "asset-1" }], parent: { id: "loc-1" }, tags: [{ id: "tag-1" }] });
       }
-      if (req.method === "PUT" && req.path === "/api/v1/items/item-1") {
-        expect(req.body).toMatchObject({ id: "item-1", name: "New", description: "Updated", locationId: "loc-1" });
+      if (req.method === "PUT" && req.path === "/api/v1/entities/entity-1") {
+        expect(req.body).toMatchObject({ id: "entity-1", name: "New", description: "Updated", parentId: "loc-1" });
         return json(res, 200, req.body);
       }
       json(res, 404, { error: `${req.method} ${req.path}` });
@@ -129,16 +131,15 @@ describe("Homebox workflows", () => {
   it("replaces primary photo without local file paths", async () => {
     const base64 = Buffer.from("image-bytes", "utf8").toString("base64");
     mock = await startMockHomebox((req, res) => {
-      if (req.method === "GET" && req.path === "/api/v1/entities") return json(res, 200, { items: [] });
-      if (req.method === "GET" && req.path === "/api/v1/entities/item-1") {
-        return json(res, 200, { id: "item-1", attachments: [{ id: "att-old", primary: true }] });
+      if (req.method === "GET" && req.path === "/api/v1/entities/entity-1") {
+        return json(res, 200, { id: "entity-1", attachments: [{ id: "att-old", primary: true }] });
       }
-      if (req.method === "POST" && req.path === "/api/v1/entities/item-1/attachments") {
+      if (req.method === "POST" && req.path === "/api/v1/entities/entity-1/attachments") {
         expect(req.bodyText).toContain('name="file"');
         expect(req.bodyText).toContain('name="primary"');
         return json(res, 201, { id: "att-new", primary: true });
       }
-      if (req.method === "DELETE" && req.path === "/api/v1/entities/item-1/attachments/att-old") {
+      if (req.method === "DELETE" && req.path === "/api/v1/entities/entity-1/attachments/att-old") {
         res.statusCode = 204;
         res.end();
         return;
@@ -147,7 +148,7 @@ describe("Homebox workflows", () => {
     });
 
     const client = new HomeboxClient(mock.url, 5_000, 1024, 1024);
-    const result = await replacePrimaryPhoto(client, "token", { itemId: "item-1", fileName: "photo.jpg", base64, contentType: "image/jpeg", deletePreviousPrimary: true });
+    const result = await replacePrimaryPhoto(client, "token", { itemId: "entity-1", fileName: "photo.jpg", base64, contentType: "image/jpeg", deletePreviousPrimary: true });
 
     expect(result.previousPrimaryAttachmentIds).toEqual(["att-old"]);
     expect(result.deletedPreviousPrimaryIds).toEqual(["att-old"]);

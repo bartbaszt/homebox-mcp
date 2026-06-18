@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { authHeader, HomeboxClient, mergeItemForPut } from "../../src/homebox-client.js";
+import { authHeader, HomeboxClient, mergeEntityForPut } from "../../src/homebox-client.js";
 import { normalizeHomeboxUrl } from "../../src/config.js";
 import { HomeboxMcpError } from "../../src/errors.js";
 import { json, startMockHomebox, type MockHomeboxServer } from "../support/mock-homebox.js";
@@ -47,9 +47,23 @@ describe("Homebox client", () => {
     expect(refresh.token).toBe("Bearer refreshed-token");
   });
 
+  it("logs out the current token on the Homebox server", async () => {
+    mock = await startMockHomebox((req, res) => {
+      if (req.method === "POST" && req.path === "/api/v1/users/logout") {
+        expect(req.headers.authorization).toBe("Bearer token");
+        res.statusCode = 204;
+        res.end();
+        return;
+      }
+      json(res, 404, { error: "not found" });
+    });
+    const client = new HomeboxClient(mock.url, 5_000, 1024, 1024);
+    await expect(client.logout("token")).resolves.toEqual(undefined);
+  });
+
   it("lists currencies from the documented currency endpoint", async () => {
     mock = await startMockHomebox((req, res) => {
-      if (req.method === "GET" && req.path === "/api/v1/currency") {
+      if (req.method === "GET" && req.path === "/api/v1/currencies") {
         expect(req.headers.authorization).toBeUndefined();
         json(res, 200, [{ code: "USD", decimals: 2, local: "US dollar", name: "United States Dollar", symbol: "$" }]);
         return;
@@ -69,6 +83,7 @@ describe("Homebox client", () => {
         if (req.query.get("q") === "drill") {
           expect(req.query.get("page")).toBe("2");
           expect(req.query.get("tags")).toBe("tag-1");
+          expect(req.query.get("isLocation")).toBe("true");
         }
         json(res, 200, { total: 1, items: [{ id: "entity-1", name: "Drill" }] });
         return;
@@ -151,6 +166,13 @@ describe("Homebox client", () => {
         return;
       }
       if (req.method === "POST" && req.path === "/api/v1/templates/template-1/create-item") return json(res, 201, { id: "entity-from-template" });
+      if (req.method === "GET" && req.path === "/api/v1/tags/tag-1") return json(res, 200, { id: "tag-1", name: "Tool" });
+      if (req.method === "PUT" && req.path === "/api/v1/tags/tag-1") return json(res, 200, req.body);
+      if (req.method === "DELETE" && req.path === "/api/v1/tags/tag-1") {
+        res.statusCode = 204;
+        res.end();
+        return;
+      }
       json(res, 404, { error: `${req.method} ${req.path}` });
     });
 
@@ -158,7 +180,7 @@ describe("Homebox client", () => {
     const csvBase64 = Buffer.from("id,name\nentity-1,Drill\n", "utf8").toString("base64");
     const fileBase64 = Buffer.from("file-bytes", "utf8").toString("base64");
 
-    await expect(client.listEntities("token", { q: "drill", page: 2, tags: ["tag-1"] })).resolves.toMatchObject({ total: 1 });
+    await expect(client.listEntities("token", { q: "drill", page: 2, tags: ["tag-1"], isLocation: true })).resolves.toMatchObject({ total: 1 });
     await expect(client.createEntity("token", { name: "Drill", entityTypeId: "type-1" })).resolves.toMatchObject({ id: "entity-1" });
     await expect(client.exportEntities("token")).resolves.toMatchObject({ contentType: "text/csv", text: "id,name\nentity-1,Drill\n" });
     await expect(client.importEntities({ token: "token", fileName: "entities.csv", base64: csvBase64, contentType: "text/csv" })).resolves.toEqual(undefined);
@@ -188,27 +210,152 @@ describe("Homebox client", () => {
     await expect(client.updateEntityTemplate("token", "template-1", { name: "Default" })).resolves.toMatchObject({ name: "Default" });
     await expect(client.deleteEntityTemplate("token", "template-1")).resolves.toEqual(undefined);
     await expect(client.createEntityFromTemplate("token", "template-1", { name: "From template" })).resolves.toMatchObject({ id: "entity-from-template" });
+    await expect(client.getTag("token", "tag-1")).resolves.toMatchObject({ id: "tag-1" });
+    await expect(client.updateTag("token", "tag-1", { name: "Tools" })).resolves.toMatchObject({ name: "Tools" });
+    await expect(client.deleteTag("token", "tag-1")).resolves.toEqual(undefined);
     await expect(client.deleteEntity("token", "entity-1")).resolves.toEqual(undefined);
   });
 
-  it("merges full item updates without losing fields, tags, or locationId", async () => {
+  it("routes listLocations to /api/v1/entities?isLocation=true and createLocation injects isLocation", async () => {
     mock = await startMockHomebox((req, res) => {
-      if (req.method === "GET" && req.path === "/api/v1/items/item-1") {
-        json(res, 200, currentItem());
+      if (req.method === "GET" && req.path === "/api/v1/entities") {
+        expect(req.query.get("isLocation")).toBe("true");
+        return json(res, 200, [{ id: "loc-1", name: "Garage" }]);
+      }
+      if (req.method === "POST" && req.path === "/api/v1/entities") {
+        expect(req.body).toMatchObject({ name: "Shelf", isLocation: true, parentId: "loc-1" });
+        return json(res, 201, { id: "loc-shelf", name: "Shelf" });
+      }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+
+    const client = new HomeboxClient(mock.url, 5_000, 1024, 1024);
+    await expect(client.listLocations("token")).resolves.toEqual([{ id: "loc-1", name: "Garage" }]);
+    await expect(client.createLocation("token", { name: "Shelf", parentId: "loc-1" })).resolves.toMatchObject({ id: "loc-shelf" });
+  });
+
+  it("calls v0.26 group, statistics, actions, reporting, barcode and user endpoints", async () => {
+    mock = await startMockHomebox((req, res) => {
+      expect(req.headers.authorization).toBe("Bearer token");
+      if (req.method === "GET" && req.path === "/api/v1/groups") return json(res, 200, { id: "group-1", name: "Home" });
+      if (req.method === "PUT" && req.path === "/api/v1/groups") return json(res, 200, req.body);
+      if (req.method === "POST" && req.path === "/api/v1/groups") return json(res, 201, { id: "group-2" });
+      if (req.method === "DELETE" && req.path === "/api/v1/groups") { res.statusCode = 204; return res.end(); }
+      if (req.method === "GET" && req.path === "/api/v1/groups/invitations") return json(res, 200, [{ id: "inv-1" }]);
+      if (req.method === "POST" && req.path === "/api/v1/groups/invitations") return json(res, 201, { id: "inv-1" });
+      if (req.method === "POST" && req.path === "/api/v1/groups/invitations/inv-1") return json(res, 200, { accepted: true });
+      if (req.method === "DELETE" && req.path === "/api/v1/groups/invitations/inv-1") { res.statusCode = 204; return res.end(); }
+      if (req.method === "GET" && req.path === "/api/v1/groups/members") return json(res, 200, [{ id: "user-1" }]);
+      if (req.method === "DELETE" && req.path === "/api/v1/groups/members/user-1") { res.statusCode = 204; return res.end(); }
+      if (req.method === "GET" && req.path === "/api/v1/groups/statistics") return json(res, 200, { totalItems: 5 });
+      if (req.method === "GET" && req.path === "/api/v1/groups/statistics/locations") return json(res, 200, [{ id: "loc-1", count: 2 }]);
+      if (req.method === "GET" && req.path === "/api/v1/groups/statistics/purchase-price") return json(res, 200, { total: 100 });
+      if (req.method === "GET" && req.path === "/api/v1/groups/statistics/tags") return json(res, 200, [{ id: "tag-1", count: 3 }]);
+      if (req.method === "GET" && req.path === "/api/v1/group/exports") return json(res, 200, [{ id: "exp-1" }]);
+      if (req.method === "POST" && req.path === "/api/v1/group/exports") return json(res, 201, { id: "exp-1" });
+      if (req.method === "GET" && req.path === "/api/v1/group/exports/exp-1") return json(res, 200, { id: "exp-1", status: "completed" });
+      if (req.method === "DELETE" && req.path === "/api/v1/group/exports/exp-1") { res.statusCode = 204; return res.end(); }
+      if (req.method === "GET" && req.path === "/api/v1/group/exports/exp-1/download") {
+        res.setHeader("content-type", "application/zip");
+        res.end("zip-bytes");
         return;
       }
-      if (req.method === "PUT" && req.path === "/api/v1/items/item-1") {
+      if (req.method === "POST" && req.path === "/api/v1/group/import") {
+        expect(req.bodyText).toContain('name="file"');
+        res.statusCode = 204;
+        return res.end();
+      }
+      if (req.method === "GET" && req.path === "/api/v1/reporting/bill-of-materials") {
+        res.setHeader("content-type", "text/csv");
+        return res.end("bom\n");
+      }
+      if (req.method === "POST" && req.path === "/api/v1/actions/create-missing-thumbnails") return json(res, 200, { ok: true });
+      if (req.method === "POST" && req.path === "/api/v1/actions/ensure-asset-ids") return json(res, 200, { ok: true });
+      if (req.method === "POST" && req.path === "/api/v1/actions/ensure-import-refs") return json(res, 200, { ok: true });
+      if (req.method === "POST" && req.path === "/api/v1/actions/set-primary-photos") return json(res, 200, { ok: true });
+      if (req.method === "POST" && req.path === "/api/v1/actions/wipe-inventory") return json(res, 200, { ok: true });
+      if (req.method === "POST" && req.path === "/api/v1/actions/zero-item-time-fields") return json(res, 200, { ok: true });
+      if (req.method === "GET" && req.path === "/api/v1/assets/asset-1") return json(res, 200, { id: "entity-1", assetId: "asset-1" });
+      if (req.method === "GET" && req.path === "/api/v1/products/search-from-barcode") {
+        expect(req.query.get("barcode")).toBe("5901234123457");
+        return json(res, 200, { name: "Widget" });
+      }
+      if (req.method === "POST" && req.path === "/api/v1/qrcode") return json(res, 201, { id: "qr-1" });
+      if (req.method === "GET" && req.path === "/api/v1/users/self") return json(res, 200, { id: "user-1", name: "Alice" });
+      if (req.method === "PUT" && req.path === "/api/v1/users/self") return json(res, 200, req.body);
+      if (req.method === "DELETE" && req.path === "/api/v1/users/self") { res.statusCode = 204; return res.end(); }
+      if (req.method === "GET" && req.path === "/api/v1/users/self/settings") return json(res, 200, { theme: "dark" });
+      if (req.method === "PUT" && req.path === "/api/v1/users/self/settings") return json(res, 200, req.body);
+      if (req.method === "PUT" && req.path === "/api/v1/users/change-password") return json(res, 200, { ok: true });
+      if (req.method === "GET" && req.path === "/api/v1/users/self/api-keys") return json(res, 200, [{ id: "key-1" }]);
+      if (req.method === "POST" && req.path === "/api/v1/users/self/api-keys") return json(res, 201, { id: "key-1", key: "hb_secret" });
+      if (req.method === "DELETE" && req.path === "/api/v1/users/self/api-keys/key-1") { res.statusCode = 204; return res.end(); }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+
+    const client = new HomeboxClient(mock.url, 5_000, 1024, 4096);
+    const zipBase64 = Buffer.from("zip-bytes", "utf8").toString("base64");
+
+    await expect(client.getGroup("token")).resolves.toMatchObject({ id: "group-1" });
+    await expect(client.updateGroup("token", { name: "Home 2" })).resolves.toMatchObject({ name: "Home 2" });
+    await expect(client.createGroup("token", { name: "New" })).resolves.toMatchObject({ id: "group-2" });
+    await expect(client.deleteGroup("token")).resolves.toEqual(undefined);
+    await expect(client.listGroupInvitations("token")).resolves.toEqual([{ id: "inv-1" }]);
+    await expect(client.createGroupInvitation("token", { email: "x@y.z" })).resolves.toMatchObject({ id: "inv-1" });
+    await expect(client.acceptGroupInvitation("token", "inv-1")).resolves.toMatchObject({ accepted: true });
+    await expect(client.deleteGroupInvitation("token", "inv-1")).resolves.toEqual(undefined);
+    await expect(client.listGroupMembers("token")).resolves.toEqual([{ id: "user-1" }]);
+    await expect(client.removeGroupMember("token", "user-1")).resolves.toEqual(undefined);
+    await expect(client.listGroupStatistics("token")).resolves.toMatchObject({ totalItems: 5 });
+    await expect(client.listLocationStatistics("token")).resolves.toEqual([{ id: "loc-1", count: 2 }]);
+    await expect(client.listPurchasePriceStatistics("token")).resolves.toMatchObject({ total: 100 });
+    await expect(client.listTagStatistics("token")).resolves.toEqual([{ id: "tag-1", count: 3 }]);
+    await expect(client.listGroupExports("token")).resolves.toEqual([{ id: "exp-1" }]);
+    await expect(client.startGroupExport("token")).resolves.toMatchObject({ id: "exp-1" });
+    await expect(client.getGroupExport("token", "exp-1")).resolves.toMatchObject({ status: "completed" });
+    await expect(client.deleteGroupExport("token", "exp-1")).resolves.toEqual(undefined);
+    await expect(client.downloadGroupExportArtifact("token", "exp-1")).resolves.toMatchObject({ exportId: "exp-1", contentLength: 9 });
+    await expect(client.importGroupZip({ token: "token", fileName: "export.zip", base64: zipBase64, contentType: "application/zip" })).resolves.toEqual(undefined);
+    await expect(client.billOfMaterials("token")).resolves.toMatchObject({ text: "bom\n" });
+    await expect(client.createMissingThumbnails("token")).resolves.toMatchObject({ ok: true });
+    await expect(client.ensureAssetIds("token")).resolves.toMatchObject({ ok: true });
+    await expect(client.ensureImportRefs("token")).resolves.toMatchObject({ ok: true });
+    await expect(client.setPrimaryPhotos("token")).resolves.toMatchObject({ ok: true });
+    await expect(client.wipeInventory("token")).resolves.toMatchObject({ ok: true });
+    await expect(client.zeroItemTimeFields("token")).resolves.toMatchObject({ ok: true });
+    await expect(client.getAssetByAssetId("token", "asset-1")).resolves.toMatchObject({ assetId: "asset-1" });
+    await expect(client.searchFromBarcode("token", "5901234123457")).resolves.toMatchObject({ name: "Widget" });
+    await expect(client.createQrCode("token", { entityId: "entity-1" })).resolves.toMatchObject({ id: "qr-1" });
+    await expect(client.getUserSelf("token")).resolves.toMatchObject({ name: "Alice" });
+    await expect(client.updateUserSelf("token", { name: "Alice 2" })).resolves.toMatchObject({ name: "Alice 2" });
+    await expect(client.deleteUserSelf("token")).resolves.toEqual(undefined);
+    await expect(client.getUserSettings("token")).resolves.toMatchObject({ theme: "dark" });
+    await expect(client.updateUserSettings("token", { theme: "light" })).resolves.toMatchObject({ theme: "light" });
+    await expect(client.changePassword("token", { currentPassword: "a", newPassword: "b" })).resolves.toMatchObject({ ok: true });
+    await expect(client.listApiKeys("token")).resolves.toEqual([{ id: "key-1" }]);
+    await expect(client.createApiKey("token", { name: "ci" })).resolves.toMatchObject({ id: "key-1" });
+    await expect(client.deleteApiKey("token", "key-1")).resolves.toEqual(undefined);
+  });
+
+  it("merges full entity updates without losing fields, tags, or parentId", async () => {
+    mock = await startMockHomebox((req, res) => {
+      if (req.method === "GET" && req.path === "/api/v1/entities/entity-1") {
+        json(res, 200, currentEntity());
+        return;
+      }
+      if (req.method === "PUT" && req.path === "/api/v1/entities/entity-1") {
         expect(req.headers.authorization).toBe("Bearer token");
         expect(req.body).toMatchObject({
-          id: "item-1",
+          id: "entity-1",
           name: "Drill",
           description: "New description",
-          locationId: "loc-1",
+          parentId: "parent-1",
           tagIds: ["tag-1"],
         });
-        const body = req.body as { fields: Array<{ name: string; textValue?: string }>; location?: unknown; tags?: unknown };
-        expect(body.location).toBeUndefined();
+        const body = req.body as { fields: Array<{ name: string; textValue?: string }>; parent?: unknown; tags?: unknown; entityType?: unknown };
+        expect(body.parent).toBeUndefined();
         expect(body.tags).toBeUndefined();
+        expect(body.entityType).toBeUndefined();
         expect(body.fields).toEqual([
           { name: "Keep", textValue: "old" },
           { name: "Replace", textValue: "new" },
@@ -220,19 +367,14 @@ describe("Homebox client", () => {
     });
 
     const client = new HomeboxClient(mock.url, 5_000, 1024, 1024);
-    await client.updateItem("token", "item-1", {
+    await client.updateItem("token", "entity-1", {
       description: "New description",
       fields: [{ name: "Replace", textValue: "new" }],
     });
   });
 
-  it("detects entities surface and routes legacy method names to /entities", async () => {
-    const seenPaths: string[] = [];
+  it("setPrimaryAttachment routes to PUT /entities/{id}/attachments/{att} with {primary:true}", async () => {
     mock = await startMockHomebox((req, res) => {
-      seenPaths.push(`${req.method} ${req.path}`);
-      if (req.method === "GET" && req.path === "/api/v1/entities") {
-        return json(res, 200, { total: 0, items: [] });
-      }
       if (req.method === "GET" && req.path === "/api/v1/entities/entity-1") {
         return json(res, 200, { id: "entity-1", attachments: [{ id: "att-1" }] });
       }
@@ -244,62 +386,7 @@ describe("Homebox client", () => {
     });
 
     const client = new HomeboxClient(mock.url, 5_000, 1024, 1024);
-    await expect(client.getApiSurface("token")).resolves.toBe("entities");
-    expect(client.currentApiSurface()).toBe("entities");
-
-    await expect(client.listItems("token", { pageSize: 1 })).resolves.toMatchObject({ items: [] });
-    await expect(client.getItem("token", "entity-1")).resolves.toMatchObject({ id: "entity-1" });
     await expect(client.setPrimaryAttachment("token", "entity-1", "att-1")).resolves.toMatchObject({ primary: true });
-
-    expect(seenPaths.filter((p) => p.startsWith("GET /api/v1/items")).length).toBe(0);
-    expect(seenPaths).toContain("GET /api/v1/entities");
-    expect(seenPaths).toContain("GET /api/v1/entities/entity-1");
-    expect(seenPaths).toContain("PUT /api/v1/entities/entity-1/attachments/att-1");
-  });
-
-  it("detects items surface and routes new method names to /items", async () => {
-    const seenPaths: string[] = [];
-    mock = await startMockHomebox((req, res) => {
-      seenPaths.push(`${req.method} ${req.path}`);
-      if (req.path.startsWith("/api/v1/entities") || req.path.startsWith("/api/v1/entity-types")) {
-        return json(res, 404, { error: "not found", kind: "not_found" });
-      }
-      if (req.method === "GET" && req.path === "/api/v1/items") {
-        expect(req.query.get("locations")).toBe("loc-1");
-        return json(res, 200, { total: 0, items: [] });
-      }
-      if (req.method === "POST" && req.path === "/api/v1/items") {
-        expect(req.body).toMatchObject({ name: "Drill", locationId: "loc-1" });
-        const body = req.body as Record<string, unknown>;
-        expect(body.parentId).toBeUndefined();
-        expect(body.entityTypeId).toBeUndefined();
-        return json(res, 201, { id: "item-1", name: "Drill" });
-      }
-      if (req.method === "PATCH" && req.path === "/api/v1/items/item-1") {
-        expect(req.body).toMatchObject({ locationId: "loc-2" });
-        return json(res, 200, req.body);
-      }
-      if (req.method === "GET" && req.path === "/api/v1/locations") return json(res, 200, [{ id: "loc-1" }]);
-      if (req.method === "GET" && req.path === "/api/v1/items/fields") return json(res, 200, ["Color"]);
-      if (req.method === "GET" && req.path === "/api/v1/items/item-1/maintenance") {
-        expect(req.query.get("status")).toBe("both");
-        return json(res, 200, []);
-      }
-      json(res, 404, { error: `${req.method} ${req.path}` });
-    });
-
-    const client = new HomeboxClient(mock.url, 5_000, 1024, 1024);
-    await expect(client.getApiSurface("token")).resolves.toBe("items");
-
-    await expect(client.listEntities("token", { parentIds: ["loc-1"] })).resolves.toMatchObject({ total: 0 });
-    await expect(client.createEntity("token", { name: "Drill", parentId: "loc-1", entityTypeId: "type-1" })).resolves.toMatchObject({ id: "item-1" });
-    await expect(client.patchEntity("token", "item-1", { parentId: "loc-2" })).resolves.toMatchObject({ locationId: "loc-2" });
-    await expect(client.listLocations("token")).resolves.toEqual([{ id: "loc-1" }]);
-    await expect(client.listEntityFieldNames("token")).resolves.toEqual(["Color"]);
-    await expect(client.listEntityMaintenance("token", "item-1", "both")).resolves.toEqual([]);
-
-    expect(seenPaths.filter((p) => p.startsWith("GET /api/v1/entities") && !p.includes("?")).length).toBeGreaterThan(0);
-    expect(seenPaths.filter((p) => p.startsWith("GET /api/v1/items") || p.includes("/api/v1/items/")).length).toBeGreaterThan(0);
   });
 
   it("rejects generic requests outside /api/v1", async () => {
@@ -310,7 +397,7 @@ describe("Homebox client", () => {
 
   it("pure merge helper preserves fields by name", () => {
     expect(
-      mergeItemForPut(currentItem(), {
+      mergeEntityForPut(currentEntity(), {
         fields: [{ name: "Replace", textValue: "new" }],
       }).fields,
     ).toEqual([
@@ -320,21 +407,20 @@ describe("Homebox client", () => {
   });
 });
 
-function currentItem() {
+function currentEntity() {
   return {
-    id: "item-1",
+    id: "entity-1",
     name: "Drill",
     description: "Old description",
     quantity: 1,
     insured: false,
     archived: false,
-    location: { id: "loc-1", name: "Garage" },
+    parent: { id: "parent-1", name: "Garage" },
     tags: [{ id: "tag-1", name: "Tool" }],
     fields: [
       { name: "Keep", textValue: "old" },
       { name: "Replace", textValue: "old" },
     ],
-    parent: { id: "parent-1" },
     entityType: { id: "type-1" },
   };
 }

@@ -52,21 +52,16 @@ describe("HTTP MCP server", () => {
   it("serves Homebox tools over Streamable HTTP", async () => {
     mock = await startMockHomebox((req, res) => {
       if (req.method === "GET" && req.path === "/api/v1/status") {
-        json(res, 200, { health: true, build: { version: "0.25.0" } });
+        json(res, 200, { health: true, build: { version: "0.26.1" } });
         return;
       }
-      if (req.method === "GET" && req.path === "/api/v1/currency") {
+      if (req.method === "GET" && req.path === "/api/v1/currencies") {
         expect(req.headers.authorization).toBeUndefined();
         json(res, 200, [{ code: "USD", decimals: 2, local: "US dollar", name: "United States Dollar", symbol: "$" }]);
         return;
       }
       if (req.method === "POST" && req.path === "/api/v1/users/login") {
         json(res, 200, { token: "Bearer user-token", expiresAt: "2030-01-01T00:00:00Z" });
-        return;
-      }
-      if (req.method === "GET" && req.path === "/api/v1/items") {
-        expect(req.headers.authorization).toBe("Bearer user-token");
-        json(res, 200, { page: 1, pageSize: 1, total: 1, items: [{ id: "item-1", name: "Drill" }] });
         return;
       }
       if (req.method === "GET" && req.path === "/api/v1/entities") {
@@ -117,9 +112,9 @@ describe("HTTP MCP server", () => {
         json(res, 200, { token: "Bearer oauth-homebox-token", expiresAt: "2030-01-01T00:00:00Z" });
         return;
       }
-      if (req.method === "GET" && req.path === "/api/v1/items") {
+      if (req.method === "GET" && req.path === "/api/v1/entities") {
         expect(req.headers.authorization).toBe("Bearer oauth-homebox-token");
-        json(res, 200, { page: 1, pageSize: 1, total: 1, items: [{ id: "item-oauth", name: "OAuth Drill" }] });
+        json(res, 200, { page: 1, pageSize: 1, total: 1, items: [{ id: "entity-oauth", name: "OAuth Drill" }] });
         return;
       }
       json(res, 404, { error: `${req.method} ${req.path}` });
@@ -240,12 +235,8 @@ describe("HTTP MCP server", () => {
         return;
       }
       if (req.method === "GET" && req.path === "/api/v1/entities") {
-        json(res, 404, { error: "not found" });
-        return;
-      }
-      if (req.method === "GET" && req.path === "/api/v1/items") {
         expect(req.headers.authorization).toBe("Bearer persisted-homebox-token");
-        json(res, 200, { page: 1, pageSize: 1, total: 1, items: [{ id: "item-persisted", name: "Persisted OAuth Drill" }] });
+        json(res, 200, { page: 1, pageSize: 1, total: 1, items: [{ id: "entity-persisted", name: "Persisted OAuth Drill" }] });
         return;
       }
       json(res, 404, { error: `${req.method} ${req.path}` });

@@ -18,7 +18,6 @@ import { HomeboxMcpError } from "./errors.js";
 
 export type JsonObject = Record<string, unknown>;
 export type QueryValue = string | number | boolean | null | undefined | Array<string | number | boolean>;
-export type ApiSurface = "items" | "entities";
 
 export interface LoginResponse {
   token: string;
@@ -86,9 +85,6 @@ export interface UploadCsvInput {
 const API_PREFIX = "/api/v1/";
 
 export class HomeboxClient {
-  private cachedSurface: ApiSurface | undefined;
-  private surfacePromise: Promise<ApiSurface> | undefined;
-
   constructor(
     private readonly baseUrl: string,
     private readonly timeoutMs: number,
@@ -98,46 +94,6 @@ export class HomeboxClient {
 
   async status(): Promise<unknown> {
     return this.request("GET", "/api/v1/status");
-  }
-
-  async getApiSurface(token: string): Promise<ApiSurface> {
-    if (this.cachedSurface) return this.cachedSurface;
-    if (!this.surfacePromise) {
-      this.surfacePromise = this.probeApiSurface(token).then(
-        (result) => {
-          this.cachedSurface = result;
-          return result;
-        },
-        (err) => {
-          this.surfacePromise = undefined;
-          throw err;
-        },
-      );
-    }
-    return this.surfacePromise;
-  }
-
-  currentApiSurface(): ApiSurface | undefined {
-    return this.cachedSurface;
-  }
-
-  resetApiSurface(): void {
-    this.cachedSurface = undefined;
-    this.surfacePromise = undefined;
-  }
-
-  private async probeApiSurface(token: string): Promise<ApiSurface> {
-    try {
-      await this.rawRequest("GET", "/api/v1/entities", { token, query: { pageSize: 1 } });
-      return "entities";
-    } catch (err) {
-      if (err instanceof HomeboxMcpError && err.status === 404) return "items";
-      throw err;
-    }
-  }
-
-  async listCurrencies(token?: string): Promise<unknown> {
-    return this.request("GET", "/api/v1/currency", token ? { token } : {});
   }
 
   async login(username: string, password: string, stayLoggedIn = true): Promise<LoginResponse> {
@@ -152,114 +108,263 @@ export class HomeboxClient {
     return normalizeTokenResponse(response, "refresh");
   }
 
+  async logout(token: string): Promise<unknown> {
+    return this.request("POST", "/api/v1/users/logout", { token });
+  }
+
   async listCollections(token: string): Promise<unknown> {
     return this.request("GET", "/api/v1/groups/all", { token });
   }
 
-  async listItems(token: string, input: { page?: number; pageSize?: number; collectionId?: string; query?: Record<string, QueryValue> }): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const query: Record<string, QueryValue> = { ...input.query };
-    if (input.page !== undefined) query.page = input.page;
-    if (input.pageSize !== undefined) query.pageSize = input.pageSize;
-    if (surface === "entities") {
-      return this.request("GET", "/api/v1/entities", { token, query });
-    }
-    if (input.collectionId) query.groupId = input.collectionId;
-    return this.request("GET", "/api/v1/items", { token, query });
+  async getGroup(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/groups", { token });
   }
 
-  async listEntities(token: string, input: { q?: string; page?: number; pageSize?: number; tags?: string[]; parentIds?: string[]; query?: Record<string, QueryValue> }): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
+  async updateGroup(token: string, body: JsonObject): Promise<unknown> {
+    return this.request("PUT", "/api/v1/groups", { token, body });
+  }
+
+  async createGroup(token: string, body: JsonObject): Promise<unknown> {
+    return this.request("POST", "/api/v1/groups", { token, body });
+  }
+
+  async deleteGroup(token: string): Promise<unknown> {
+    return this.request("DELETE", "/api/v1/groups", { token });
+  }
+
+  async listGroupInvitations(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/groups/invitations", { token });
+  }
+
+  async createGroupInvitation(token: string, body: JsonObject): Promise<unknown> {
+    return this.request("POST", "/api/v1/groups/invitations", { token, body });
+  }
+
+  async acceptGroupInvitation(token: string, invitationId: string, body?: JsonObject): Promise<unknown> {
+    return this.request("POST", `/api/v1/groups/invitations/${encodeURIComponent(invitationId)}`, { token, body: body ?? {} });
+  }
+
+  async deleteGroupInvitation(token: string, invitationId: string): Promise<unknown> {
+    return this.request("DELETE", `/api/v1/groups/invitations/${encodeURIComponent(invitationId)}`, { token });
+  }
+
+  async listGroupMembers(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/groups/members", { token });
+  }
+
+  async removeGroupMember(token: string, userId: string): Promise<unknown> {
+    return this.request("DELETE", `/api/v1/groups/members/${encodeURIComponent(userId)}`, { token });
+  }
+
+  async listGroupStatistics(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/groups/statistics", { token });
+  }
+
+  async listLocationStatistics(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/groups/statistics/locations", { token });
+  }
+
+  async listPurchasePriceStatistics(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/groups/statistics/purchase-price", { token });
+  }
+
+  async listTagStatistics(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/groups/statistics/tags", { token });
+  }
+
+  async listGroupExports(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/group/exports", { token });
+  }
+
+  async startGroupExport(token: string, body?: JsonObject): Promise<unknown> {
+    return this.request("POST", "/api/v1/group/exports", { token, body: body ?? {} });
+  }
+
+  async getGroupExport(token: string, exportId: string): Promise<unknown> {
+    return this.request("GET", `/api/v1/group/exports/${encodeURIComponent(exportId)}`, { token });
+  }
+
+  async deleteGroupExport(token: string, exportId: string): Promise<unknown> {
+    return this.request("DELETE", `/api/v1/group/exports/${encodeURIComponent(exportId)}`, { token });
+  }
+
+  async downloadGroupExportArtifact(token: string, exportId: string): Promise<DownloadedFile & { exportId: string }> {
+    const file = await this.downloadFile(`/api/v1/group/exports/${encodeURIComponent(exportId)}/download`, token);
+    return { exportId, ...file };
+  }
+
+  async importGroupZip(input: UploadCsvInput): Promise<unknown> {
+    return this.request("POST", "/api/v1/group/import", {
+      token: input.token,
+      body: this.multipartFile("file", input.fileName, input.base64, input.contentType),
+    });
+  }
+
+  async billOfMaterials(token: string): Promise<DownloadedFile> {
+    return this.downloadFile("/api/v1/reporting/bill-of-materials", token);
+  }
+
+  async createMissingThumbnails(token: string): Promise<unknown> {
+    return this.request("POST", "/api/v1/actions/create-missing-thumbnails", { token });
+  }
+
+  async ensureAssetIds(token: string): Promise<unknown> {
+    return this.request("POST", "/api/v1/actions/ensure-asset-ids", { token });
+  }
+
+  async ensureImportRefs(token: string): Promise<unknown> {
+    return this.request("POST", "/api/v1/actions/ensure-import-refs", { token });
+  }
+
+  async setPrimaryPhotos(token: string): Promise<unknown> {
+    return this.request("POST", "/api/v1/actions/set-primary-photos", { token });
+  }
+
+  async wipeInventory(token: string, body?: JsonObject): Promise<unknown> {
+    return this.request("POST", "/api/v1/actions/wipe-inventory", { token, body: body ?? {} });
+  }
+
+  async zeroItemTimeFields(token: string): Promise<unknown> {
+    return this.request("POST", "/api/v1/actions/zero-item-time-fields", { token });
+  }
+
+  async getAssetByAssetId(token: string, assetId: string): Promise<unknown> {
+    return this.request("GET", `/api/v1/assets/${encodeURIComponent(assetId)}`, { token });
+  }
+
+  async searchFromBarcode(token: string, barcode: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/products/search-from-barcode", { token, query: { barcode } });
+  }
+
+  async createQrCode(token: string, body?: JsonObject): Promise<unknown> {
+    return this.request("POST", "/api/v1/qrcode", { token, body: body ?? {} });
+  }
+
+  async listApiKeys(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/users/self/api-keys", { token });
+  }
+
+  async createApiKey(token: string, body?: JsonObject): Promise<unknown> {
+    return this.request("POST", "/api/v1/users/self/api-keys", { token, body: body ?? {} });
+  }
+
+  async deleteApiKey(token: string, apiKeyId: string): Promise<unknown> {
+    return this.request("DELETE", `/api/v1/users/self/api-keys/${encodeURIComponent(apiKeyId)}`, { token });
+  }
+
+  async getUserSelf(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/users/self", { token });
+  }
+
+  async updateUserSelf(token: string, body: JsonObject): Promise<unknown> {
+    return this.request("PUT", "/api/v1/users/self", { token, body });
+  }
+
+  async deleteUserSelf(token: string, body?: JsonObject): Promise<unknown> {
+    return this.request("DELETE", "/api/v1/users/self", { token, body: body ?? {} });
+  }
+
+  async getUserSettings(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/users/self/settings", { token });
+  }
+
+  async updateUserSettings(token: string, body: JsonObject): Promise<unknown> {
+    return this.request("PUT", "/api/v1/users/self/settings", { token, body });
+  }
+
+  async changePassword(token: string, body: JsonObject): Promise<unknown> {
+    return this.request("PUT", "/api/v1/users/change-password", { token, body });
+  }
+
+  async listCurrencies(token?: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/currencies", token ? { token } : {});
+  }
+
+  async listEntities(token: string, input: { q?: string; page?: number; pageSize?: number; tags?: string[]; parentIds?: string[]; isLocation?: boolean; filterChildren?: boolean; negateTags?: boolean; orderBy?: string; includeArchived?: boolean; fields?: string[]; query?: Record<string, QueryValue> }): Promise<unknown> {
     const query: Record<string, QueryValue> = { ...input.query };
     if (input.q !== undefined) query.q = input.q;
     if (input.page !== undefined) query.page = input.page;
     if (input.pageSize !== undefined) query.pageSize = input.pageSize;
     if (input.tags) query.tags = input.tags;
-    if (surface === "entities") {
-      if (input.parentIds) query.parentIds = input.parentIds;
-      return this.request("GET", "/api/v1/entities", { token, query });
-    }
-    if (input.parentIds) query.locations = input.parentIds;
-    return this.request("GET", "/api/v1/items", { token, query });
+    if (input.parentIds) query.parentIds = input.parentIds;
+    if (input.isLocation !== undefined) query.isLocation = input.isLocation;
+    if (input.filterChildren !== undefined) query.filterChildren = input.filterChildren;
+    if (input.negateTags !== undefined) query.negateTags = input.negateTags;
+    if (input.orderBy !== undefined) query.orderBy = input.orderBy;
+    if (input.includeArchived !== undefined) query.includeArchived = input.includeArchived;
+    if (input.fields) query.fields = input.fields;
+    return this.request("GET", "/api/v1/entities", { token, query });
+  }
+
+  async listItems(token: string, input: { page?: number; pageSize?: number; collectionId?: string; query?: Record<string, QueryValue> }): Promise<unknown> {
+    const query: Record<string, QueryValue> = { ...input.query };
+    if (input.page !== undefined) query.page = input.page;
+    if (input.pageSize !== undefined) query.pageSize = input.pageSize;
+    if (input.collectionId) query.groupId = input.collectionId;
+    return this.request("GET", "/api/v1/entities", { token, query });
   }
 
   async createEntity(token: string, body: JsonObject): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    if (surface === "entities") return this.request("POST", "/api/v1/entities", { token, body });
-    return this.request("POST", "/api/v1/items", { token, body: translateBodyForItems(body) });
+    return this.request("POST", "/api/v1/entities", { token, body });
+  }
+
+  async createItem(token: string, body: JsonObject): Promise<unknown> {
+    return this.createEntity(token, body);
   }
 
   async exportEntities(token: string): Promise<DownloadedFile> {
-    const surface = await this.getApiSurface(token);
-    const path = surface === "entities" ? "/api/v1/entities/export" : "/api/v1/items/export";
-    return this.downloadFile(path, token);
+    return this.downloadFile("/api/v1/entities/export", token);
   }
 
   async importEntities(input: UploadCsvInput): Promise<unknown> {
-    const surface = await this.getApiSurface(input.token);
-    const path = surface === "entities" ? "/api/v1/entities/import" : "/api/v1/items/import";
-    return this.request("POST", path, {
+    return this.request("POST", "/api/v1/entities/import", {
       token: input.token,
       body: this.multipartFile("csv", input.fileName, input.base64, input.contentType),
     });
   }
 
   async listEntityFieldNames(token: string): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const path = surface === "entities" ? "/api/v1/entities/fields" : "/api/v1/items/fields";
-    return this.request("GET", path, { token });
+    return this.request("GET", "/api/v1/entities/fields", { token });
   }
 
   async listEntityFieldValues(token: string, field: string): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const path = surface === "entities" ? "/api/v1/entities/fields/values" : "/api/v1/items/fields/values";
-    return this.request("GET", path, { token, query: { field } });
+    return this.request("GET", "/api/v1/entities/fields/values", { token, query: { field } });
   }
 
   async listEntitiesTree(token: string, withItems?: boolean): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    if (surface === "entities") {
-      return this.request("GET", "/api/v1/entities/tree", { token, query: { withItems } });
-    }
-    return this.request("GET", "/api/v1/locations/tree", { token, query: { withItems } });
+    return this.request("GET", "/api/v1/entities/tree", { token, query: { withItems } });
   }
 
   async getEntity(token: string, entityId: string): Promise<JsonObject> {
-    const surface = await this.getApiSurface(token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
-    return this.request<JsonObject>("GET", `${prefix}/${encodeURIComponent(entityId)}`, { token });
+    return this.request<JsonObject>("GET", `/api/v1/entities/${encodeURIComponent(entityId)}`, { token });
+  }
+
+  async getItem(token: string, itemId: string): Promise<JsonObject> {
+    return this.getEntity(token, itemId);
   }
 
   async putEntity(token: string, entityId: string, body: JsonObject): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
-    const payload = surface === "entities" ? body : translateBodyForItems(body);
-    return this.request("PUT", `${prefix}/${encodeURIComponent(entityId)}`, { token, body: payload });
+    return this.request("PUT", `/api/v1/entities/${encodeURIComponent(entityId)}`, { token, body });
   }
 
   async patchEntity(token: string, entityId: string, body: JsonObject): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
-    const payload = surface === "entities" ? body : translateBodyForItems(body);
-    return this.request("PATCH", `${prefix}/${encodeURIComponent(entityId)}`, { token, body: payload });
+    return this.request("PATCH", `/api/v1/entities/${encodeURIComponent(entityId)}`, { token, body });
   }
 
   async deleteEntity(token: string, entityId: string): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
-    return this.request("DELETE", `${prefix}/${encodeURIComponent(entityId)}`, { token });
+    return this.request("DELETE", `/api/v1/entities/${encodeURIComponent(entityId)}`, { token });
+  }
+
+  async deleteItem(token: string, itemId: string): Promise<unknown> {
+    return this.deleteEntity(token, itemId);
   }
 
   async duplicateEntity(token: string, entityId: string, body: JsonObject): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
-    return this.request("POST", `${prefix}/${encodeURIComponent(entityId)}/duplicate`, { token, body });
+    return this.request("POST", `/api/v1/entities/${encodeURIComponent(entityId)}/duplicate`, { token, body });
   }
 
   async getEntityPath(token: string, entityId: string): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
-    return this.request("GET", `${prefix}/${encodeURIComponent(entityId)}/path`, { token });
+    return this.request("GET", `/api/v1/entities/${encodeURIComponent(entityId)}/path`, { token });
   }
 
   async listEntityAttachments(token: string, entityId: string): Promise<unknown> {
@@ -268,53 +373,37 @@ export class HomeboxClient {
   }
 
   async uploadEntityAttachment(input: UploadEntityAttachmentInput): Promise<unknown> {
-    const surface = await this.getApiSurface(input.token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
     const form = this.multipartFile("file", input.fileName, input.base64, input.contentType, {
       name: input.fileName,
       type: input.type,
       primary: input.primary,
     });
-    return this.request("POST", `${prefix}/${encodeURIComponent(input.entityId)}/attachments`, { token: input.token, body: form });
+    return this.request("POST", `/api/v1/entities/${encodeURIComponent(input.entityId)}/attachments`, { token: input.token, body: form });
   }
 
   async createExternalEntityAttachment(token: string, entityId: string, body: JsonObject): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    if (surface !== "entities") {
-      throw new HomeboxMcpError("not_found", "External link attachments require the new /entities API (not present on legacy Homebox).", 404);
-    }
     return this.request("POST", `/api/v1/entities/${encodeURIComponent(entityId)}/attachments/external`, { token, body });
   }
 
   async downloadEntityAttachment(token: string, entityId: string, attachmentId: string): Promise<DownloadedFile & { entityId: string; attachmentId: string }> {
-    const surface = await this.getApiSurface(token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
-    const file = await this.downloadFile(`${prefix}/${encodeURIComponent(entityId)}/attachments/${encodeURIComponent(attachmentId)}`, token);
+    const file = await this.downloadFile(`/api/v1/entities/${encodeURIComponent(entityId)}/attachments/${encodeURIComponent(attachmentId)}`, token);
     return { entityId, attachmentId, ...file };
   }
 
   async updateEntityAttachment(token: string, entityId: string, attachmentId: string, body: JsonObject): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
-    return this.request("PUT", `${prefix}/${encodeURIComponent(entityId)}/attachments/${encodeURIComponent(attachmentId)}`, { token, body });
+    return this.request("PUT", `/api/v1/entities/${encodeURIComponent(entityId)}/attachments/${encodeURIComponent(attachmentId)}`, { token, body });
   }
 
   async deleteEntityAttachment(token: string, entityId: string, attachmentId: string): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
-    return this.request("DELETE", `${prefix}/${encodeURIComponent(entityId)}/attachments/${encodeURIComponent(attachmentId)}`, { token });
+    return this.request("DELETE", `/api/v1/entities/${encodeURIComponent(entityId)}/attachments/${encodeURIComponent(attachmentId)}`, { token });
   }
 
   async listEntityMaintenance(token: string, entityId: string, status?: "scheduled" | "completed" | "both"): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
-    return this.request("GET", `${prefix}/${encodeURIComponent(entityId)}/maintenance`, { token, query: { status } });
+    return this.request("GET", `/api/v1/entities/${encodeURIComponent(entityId)}/maintenance`, { token, query: { status } });
   }
 
   async createEntityMaintenance(token: string, entityId: string, body: JsonObject): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    const prefix = surface === "entities" ? "/api/v1/entities" : "/api/v1/items";
-    return this.request("POST", `${prefix}/${encodeURIComponent(entityId)}/maintenance`, { token, body });
+    return this.request("POST", `/api/v1/entities/${encodeURIComponent(entityId)}/maintenance`, { token, body });
   }
 
   async listEntityTypes(token: string): Promise<unknown> {
@@ -389,22 +478,54 @@ export class HomeboxClient {
     return this.request("DELETE", `/api/v1/notifiers/${encodeURIComponent(notifierId)}`, { token });
   }
 
-  async getItem(token: string, itemId: string): Promise<JsonObject> {
-    return this.getEntity(token, itemId);
+  async listLocations(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/entities", { token, query: { isLocation: true, pageSize: 500 } });
   }
 
-  async createItem(token: string, body: JsonObject): Promise<unknown> {
-    return this.createEntity(token, body);
+  async createLocation(token: string, body: JsonObject): Promise<unknown> {
+    return this.request("POST", "/api/v1/entities", { token, body: { isLocation: true, ...body } });
+  }
+
+  async updateLocation(token: string, locationId: string, body: JsonObject): Promise<unknown> {
+    return this.request("PUT", `/api/v1/entities/${encodeURIComponent(locationId)}`, { token, body });
+  }
+
+  async deleteLocation(token: string, locationId: string): Promise<unknown> {
+    return this.request("DELETE", `/api/v1/entities/${encodeURIComponent(locationId)}`, { token });
+  }
+
+  async listTags(token: string): Promise<unknown> {
+    return this.request("GET", "/api/v1/tags", { token });
+  }
+
+  async createTag(token: string, name: string): Promise<unknown> {
+    return this.request("POST", "/api/v1/tags", { token, body: { name } });
+  }
+
+  async getTag(token: string, tagId: string): Promise<unknown> {
+    return this.request("GET", `/api/v1/tags/${encodeURIComponent(tagId)}`, { token });
+  }
+
+  async updateTag(token: string, tagId: string, body: JsonObject): Promise<unknown> {
+    return this.request("PUT", `/api/v1/tags/${encodeURIComponent(tagId)}`, { token, body });
+  }
+
+  async deleteTag(token: string, tagId: string): Promise<unknown> {
+    return this.request("DELETE", `/api/v1/tags/${encodeURIComponent(tagId)}`, { token });
+  }
+
+  async listCustomFields(token: string): Promise<unknown> {
+    return this.listEntityFieldNames(token);
+  }
+
+  async listCustomFieldValues(token: string, field: string): Promise<unknown> {
+    return this.listEntityFieldValues(token, field);
   }
 
   async updateItem(token: string, itemId: string, patch: JsonObject): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    if (surface === "entities") {
-      return this.patchEntity(token, itemId, patch);
-    }
-    const current = await this.request<JsonObject>("GET", `/api/v1/items/${encodeURIComponent(itemId)}`, { token });
-    const body = mergeItemForPut(current, translateBodyForItems(patch));
-    return this.request("PUT", `/api/v1/items/${encodeURIComponent(itemId)}`, { token, body });
+    const current = await this.getEntity(token, itemId);
+    const body = mergeEntityForPut(current, patch);
+    return this.putEntity(token, itemId, body);
   }
 
   async putItem(token: string, itemId: string, body: JsonObject): Promise<unknown> {
@@ -413,10 +534,6 @@ export class HomeboxClient {
 
   async patchItem(token: string, itemId: string, body: JsonObject): Promise<unknown> {
     return this.patchEntity(token, itemId, body);
-  }
-
-  async deleteItem(token: string, itemId: string): Promise<unknown> {
-    return this.deleteEntity(token, itemId);
   }
 
   async listAttachments(token: string, itemId: string): Promise<unknown> {
@@ -443,6 +560,14 @@ export class HomeboxClient {
       contentType: input.contentType,
       primary: input.primary,
     });
+  }
+
+  async deleteAttachment(token: string, itemId: string, attachmentId: string): Promise<unknown> {
+    return this.deleteEntityAttachment(token, itemId, attachmentId);
+  }
+
+  async setPrimaryAttachment(token: string, itemId: string, attachmentId: string): Promise<unknown> {
+    return this.updateEntityAttachment(token, itemId, attachmentId, { primary: true });
   }
 
   async fetchPublicUrlFile(url: string, fileName?: string, contentType?: string): Promise<PublicUrlFile> {
@@ -487,66 +612,6 @@ export class HomeboxClient {
     } finally {
       clearTimeout(timeout);
     }
-  }
-
-  async deleteAttachment(token: string, itemId: string, attachmentId: string): Promise<unknown> {
-    return this.deleteEntityAttachment(token, itemId, attachmentId);
-  }
-
-  async setPrimaryAttachment(token: string, itemId: string, attachmentId: string): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    if (surface === "entities") {
-      return this.updateEntityAttachment(token, itemId, attachmentId, { primary: true });
-    }
-    return this.request("PUT", `/api/v1/items/${encodeURIComponent(itemId)}/attachments/${encodeURIComponent(attachmentId)}/primary`, { token });
-  }
-
-  async listLocations(token: string): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    if (surface === "entities") {
-      return this.request("GET", "/api/v1/entities", { token, query: { isLocation: true, pageSize: 500 } });
-    }
-    return this.request("GET", "/api/v1/locations", { token });
-  }
-
-  async createLocation(token: string, body: JsonObject): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    if (surface === "entities") {
-      return this.request("POST", "/api/v1/entities", { token, body });
-    }
-    return this.request("POST", "/api/v1/locations", { token, body });
-  }
-
-  async updateLocation(token: string, locationId: string, body: JsonObject): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    if (surface === "entities") {
-      return this.request("PUT", `/api/v1/entities/${encodeURIComponent(locationId)}`, { token, body });
-    }
-    return this.request("PUT", `/api/v1/locations/${encodeURIComponent(locationId)}`, { token, body });
-  }
-
-  async deleteLocation(token: string, locationId: string): Promise<unknown> {
-    const surface = await this.getApiSurface(token);
-    if (surface === "entities") {
-      return this.request("DELETE", `/api/v1/entities/${encodeURIComponent(locationId)}`, { token });
-    }
-    return this.request("DELETE", `/api/v1/locations/${encodeURIComponent(locationId)}`, { token });
-  }
-
-  async listTags(token: string): Promise<unknown> {
-    return this.request("GET", "/api/v1/tags", { token });
-  }
-
-  async createTag(token: string, name: string): Promise<unknown> {
-    return this.request("POST", "/api/v1/tags", { token, body: { name } });
-  }
-
-  async listCustomFields(token: string): Promise<unknown> {
-    return this.listEntityFieldNames(token);
-  }
-
-  async listCustomFieldValues(token: string, field: string): Promise<unknown> {
-    return this.listEntityFieldValues(token, field);
   }
 
   async apiRequest(method: string, path: string, options: RequestOptions = {}): Promise<unknown> {
@@ -753,7 +818,7 @@ export function publicHttpUrl(raw: string): URL {
   return url;
 }
 
-export function mergeItemForPut(current: JsonObject, patch: JsonObject): JsonObject {
+export function mergeEntityForPut(current: JsonObject, patch: JsonObject): JsonObject {
   const merged: JsonObject = { ...current };
   for (const [key, value] of Object.entries(patch)) {
     if (key === "fields" && Array.isArray(value)) {
@@ -763,15 +828,14 @@ export function mergeItemForPut(current: JsonObject, patch: JsonObject): JsonObj
     }
   }
 
-  const location = current.location as JsonObject | undefined;
-  if (merged.locationId === undefined && typeof location?.id === "string") merged.locationId = location.id;
+  const parent = current.parent as JsonObject | undefined;
+  if (merged.parentId === undefined && typeof parent?.id === "string") merged.parentId = parent.id;
 
   if (merged.tagIds === undefined && Array.isArray(current.tags)) {
     const tagIds = current.tags.map((tag) => (tag as JsonObject).id).filter((id): id is string => typeof id === "string");
     if (tagIds.length > 0) merged.tagIds = tagIds;
   }
 
-  delete merged.location;
   delete merged.parent;
   delete merged.entityType;
   delete merged.tags;
@@ -854,31 +918,4 @@ function isBlockedIpv6(host: string): boolean {
     (first >= 0xfe80 && first <= 0xfebf) ||
     (first >= 0xff00 && first <= 0xffff)
   );
-}
-
-export function translateBodyForItems(body: JsonObject): JsonObject {
-  const out: JsonObject = { ...body };
-  if (typeof out.parentId === "string" || out.parentId === null) {
-    if (out.locationId === undefined) out.locationId = out.parentId;
-  }
-  delete out.parentId;
-  if (typeof out.syncChildEntityLocations === "boolean") {
-    if (out.syncChildItemsLocations === undefined) out.syncChildItemsLocations = out.syncChildEntityLocations;
-  }
-  delete out.syncChildEntityLocations;
-  delete out.entityTypeId;
-  return out;
-}
-
-export function translateBodyForEntities(body: JsonObject): JsonObject {
-  const out: JsonObject = { ...body };
-  if (typeof out.locationId === "string" || out.locationId === null) {
-    if (out.parentId === undefined) out.parentId = out.locationId;
-  }
-  delete out.locationId;
-  if (typeof out.syncChildItemsLocations === "boolean") {
-    if (out.syncChildEntityLocations === undefined) out.syncChildEntityLocations = out.syncChildItemsLocations;
-  }
-  delete out.syncChildItemsLocations;
-  return out;
 }

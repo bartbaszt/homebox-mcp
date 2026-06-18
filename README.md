@@ -13,10 +13,11 @@ This project was built with AI assistance.
 - ChatGPT Apps/Connectors OAuth flow with DCR, protected resource metadata and bearer tokens stored by the MCP client.
 - Homebox username/password login tool; password is never stored.
 - Multiple concurrent users via in-memory session keys.
-- Named tools for status, auth, collections, items, attachments, locations, tags, custom fields and higher-level item workflows.
+- Named tools for status, auth, collections, groups, statistics, items, attachments, locations, tags, custom fields and higher-level item workflows.
 - Generic `homebox_api_request` for version-specific `/api/v1/...` endpoints.
-- Safe item update helper that GET-merge-PUTs full payloads to avoid Homebox v0.25.0 partial PUT failures.
-- Auto-detection of Homebox API surface (`items` vs `entities`); single tool set works on both legacy v0.25.0 and the upcoming Entity Merge API.
+- Safe entity update helper that GET-merge-PUTs full payloads to avoid partial PUT field loss.
+- Targets Homebox v0.26.x (Entity Merge API): items and locations are unified under `/api/v1/entities/*`. The legacy `/v1/items/*` and `/v1/locations/*` endpoints were removed in v0.26.0 and are not supported.
+- v0.26 coverage: tag CRUD, group CRUD + invitations + members, group statistics, group ZIP export/import, bill of materials, actions, API keys, user self/settings/password, asset by asset ID, barcode lookup and QR code.
 
 ## Setup
 
@@ -151,23 +152,28 @@ With static MCP auth or local agents:
 
 ## Tools
 
-- Auth: `homebox_login`, `homebox_register_token`, `homebox_refresh_session`, `homebox_logout`.
+- Auth: `homebox_login`, `homebox_register_token`, `homebox_refresh_session`, `homebox_logout`, `homebox_logout_homebox`.
 - Instance: `homebox_status`, `homebox_list_currencies`, `homebox_api_request`.
-- Collections: `homebox_list_collections`.
-- Items: `homebox_list_items`, `homebox_get_item`, `homebox_create_item`, `homebox_update_item`, `homebox_put_item`, `homebox_patch_item`, `homebox_delete_item`.
+- Collections / groups: `homebox_list_collections`, `homebox_get_group`, `homebox_update_group`, `homebox_create_group`, `homebox_delete_group`, `homebox_list_group_invitations`, `homebox_create_group_invitation`, `homebox_accept_group_invitation`, `homebox_delete_group_invitation`, `homebox_list_group_members`, `homebox_remove_group_member`.
+- Statistics: `homebox_list_group_statistics`, `homebox_list_location_statistics`, `homebox_list_purchase_price_statistics`, `homebox_list_tag_statistics`.
+- Group export/import: `homebox_list_group_exports`, `homebox_start_group_export`, `homebox_get_group_export`, `homebox_delete_group_export`, `homebox_download_group_export_artifact`, `homebox_import_group_zip`.
+- Reporting: `homebox_bill_of_materials`.
+- Actions: `homebox_action_create_missing_thumbnails`, `homebox_action_ensure_asset_ids`, `homebox_action_ensure_import_refs`, `homebox_action_set_primary_photos`, `homebox_action_wipe_inventory`, `homebox_action_zero_item_time_fields`.
+- Items (entities): `homebox_list_items`, `homebox_get_item`, `homebox_create_item`, `homebox_update_item`, `homebox_put_item`, `homebox_patch_item`, `homebox_delete_item`.
 - Entities: `homebox_list_entities`, `homebox_create_entity`, `homebox_export_entities`, `homebox_import_entities`, `homebox_get_entity`, `homebox_put_entity`, `homebox_patch_entity`, `homebox_delete_entity`, `homebox_duplicate_entity`, `homebox_get_entity_path`, `homebox_list_entities_tree`, `homebox_list_entity_field_names`, `homebox_list_entity_field_values`.
 - Entity attachments/maintenance: `homebox_list_entity_attachments`, `homebox_upload_entity_attachment`, `homebox_create_external_entity_attachment`, `homebox_download_entity_attachment`, `homebox_update_entity_attachment`, `homebox_delete_entity_attachment`, `homebox_list_entity_maintenance`, `homebox_create_entity_maintenance`.
 - Entity types/templates: `homebox_list_entity_types`, `homebox_create_entity_type`, `homebox_update_entity_type`, `homebox_delete_entity_type`, `homebox_list_entity_templates`, `homebox_create_entity_template`, `homebox_get_entity_template`, `homebox_update_entity_template`, `homebox_delete_entity_template`, `homebox_create_entity_from_template`.
 - Maintenance log: `homebox_list_maintenance` (defaults to `status=both`), `homebox_update_maintenance_entry`, `homebox_delete_maintenance_entry`.
 - Notifiers: `homebox_list_notifiers`, `homebox_create_notifier`, `homebox_test_notifier`, `homebox_update_notifier`, `homebox_delete_notifier`.
 - Attachments: `homebox_list_attachments`, `homebox_download_attachment`, `homebox_upload_attachment`, `homebox_delete_attachment`, `homebox_set_primary_attachment`.
-- Locations/tags/fields: `homebox_list_locations`, `homebox_create_location`, `homebox_update_location`, `homebox_delete_location`, `homebox_list_tags`, `homebox_list_custom_fields`, `homebox_list_custom_field_values` (requires `field`).
+- Locations/tags/fields: `homebox_list_locations`, `homebox_create_location`, `homebox_update_location`, `homebox_delete_location`, `homebox_list_tags`, `homebox_get_tag`, `homebox_update_tag`, `homebox_delete_tag`, `homebox_list_custom_fields`, `homebox_list_custom_field_values` (requires `field`).
+- User/API keys: `homebox_get_user_self`, `homebox_update_user_self`, `homebox_delete_user_self`, `homebox_get_user_settings`, `homebox_update_user_settings`, `homebox_change_password`, `homebox_list_api_keys`, `homebox_create_api_key`, `homebox_delete_api_key`.
+- Assets/barcode/QR: `homebox_get_asset_by_asset_id`, `homebox_search_from_barcode`, `homebox_create_qr_code`.
 - Workflows: `homebox_resolve_tags`, `homebox_resolve_location`, `homebox_find_or_create_location`, `homebox_create_item_full`, `homebox_upload_primary_photo_from_file`, `homebox_replace_primary_photo`, `homebox_upsert_items_bulk`, `homebox_import_items_bulk`.
-- Diagnostics: `homebox_api_surface` reports the detected Homebox API version (`items` for legacy v0.25.0, `entities` for the new Entity Merge API).
 
 Workflow photo tools prefer public `imageUrl`/`photoUrl` values. Local paths such as `/mnt/data/...` are not supported; direct `base64` is only a fallback.
 
-Homebox UI field mapping for item tools:
+Homebox UI field mapping for item/entity tools:
 
 | Homebox UI | API field |
 |---|---|
@@ -178,51 +184,43 @@ Homebox UI field mapping for item tools:
 | Model | `modelNumber` |
 | Serial number / Numer seryjny | `serialNumber` |
 | Notes / Notatki | `notes` |
-| Location / Lokalizacja | `locationId` |
+| Location / Lokalizacja | `parentId` |
 | Tags / Tagi | `tagIds` |
 | Primary photo / thumbnail | primary attachment / `imageId` |
 
-Use `purchaseTime` for purchase date. Do not use `purchaseDate`.
+Use `purchaseTime` for purchase date. Do not use `purchaseDate`. Use `parentId` for the parent location.
 
 Recommended purchase/import workflow:
 
 1. Resolve location by name with `homebox_resolve_location` or `homebox_find_or_create_location`.
 2. Resolve or create tags with `homebox_resolve_tags`.
-3. Create an item with stable fields: `name`, `description`, `quantity`, `locationId`, `tagIds`.
+3. Create an entity with stable fields: `name`, `description`, `quantity`, `parentId`, `tagIds`.
 4. Patch `purchasePrice`, `purchaseTime`, `purchaseFrom`, `manufacturer`, `modelNumber`, `notes`.
 5. Upload the primary photo.
-6. Verify final fields with `homebox_get_item`.
+6. Verify final fields with `homebox_get_entity`.
 
 For bulk imports, prefer `homebox_import_items_bulk` or `homebox_upsert_items_bulk` over manual orchestration.
 
-## Multi-Version Compatibility
+## Homebox v0.26 Compatibility
 
-The client probes `GET /api/v1/entities?pageSize=1` on first authenticated tool call. If the endpoint responds, the server is treated as the new Entity Merge API (`entities` surface). If it returns 404, the server falls back to legacy v0.25.0 (`items` surface). The detected surface is cached for the lifetime of the MCP process.
+This server targets Homebox v0.26.x (Entity Merge API). Items and locations are unified under `/api/v1/entities/*`. Item-named tools and entity-named tools both route to `/entities/*`:
 
-Tool routing in both directions:
+| Tool family                                     | Endpoint                       |
+| ----------------------------------------------- | ------------------------------ |
+| Inventory CRUD (`homebox_*_item`, `homebox_*_entity`) | `/api/v1/entities/*`       |
+| Attachments (`homebox_*_attachment`, `homebox_*_entity_attachment`) | `/api/v1/entities/{id}/attachments/*` |
+| `homebox_set_primary_attachment`                | `PUT /entities/{id}/attachments/{id}` with `{primary: true}` |
+| `homebox_list_locations`                        | `/api/v1/entities?isLocation=true` |
+| `homebox_(create|update|delete)_location`        | `/api/v1/entities/{id}`        |
+| `homebox_list_custom_fields(_values)` / `homebox_list_entity_field_names(_values)` | `/api/v1/entities/fields(/values)` |
+| `homebox_list_entities_tree`                    | `/api/v1/entities/tree`        |
+| `homebox_export_entities` / `homebox_import_entities` | `/api/v1/entities/(export|import)` |
+| `homebox_list_entity_maintenance`               | `/api/v1/entities/{id}/maintenance` |
 
-| Tool family                                     | `entities` surface         | `items` surface             |
-| ----------------------------------------------- | -------------------------- | --------------------------- |
-| Inventory CRUD (`homebox_*_item`, `homebox_*_entity`) | `/api/v1/entities/*` | `/api/v1/items/*`           |
-| Attachments (`homebox_*_attachment`, `homebox_*_entity_attachment`) | `/api/v1/entities/{id}/attachments/*` | `/api/v1/items/{id}/attachments/*` |
-| `homebox_set_primary_attachment`                | `PUT .../attachments/{id}` with `{primary: true}` | `PUT .../attachments/{id}/primary` |
-| `homebox_list_locations`                        | `/api/v1/entities?isLocation=true` | `/api/v1/locations`          |
-| `homebox_list_custom_fields(_values)` / `homebox_list_entity_field_names(_values)` | `/api/v1/entities/fields(/values)` | `/api/v1/items/fields(/values)` |
-| `homebox_list_entities_tree`                    | `/api/v1/entities/tree`    | `/api/v1/locations/tree`     |
-| `homebox_export_entities` / `homebox_import_entities` | `/api/v1/entities/(export|import)` | `/api/v1/items/(export|import)` |
-| `homebox_list_entity_maintenance`               | `/api/v1/entities/{id}/maintenance` | `/api/v1/items/{id}/maintenance` |
+Update rules:
 
-Body translation: `parentId` <-> `locationId`, `syncChildEntityLocations` <-> `syncChildItemsLocations`, `entityTypeId` is stripped when routing to legacy items.
-
-Tools without legacy equivalents return a structured `not_found` error on `items` surface: `homebox_list_currencies`, `homebox_list_entity_types` (and friends), `homebox_create_external_entity_attachment`.
-
-Legacy Homebox v0.25 constraints:
-
-- Prefer item tools (`homebox_list_items`, `homebox_get_item`, `homebox_update_item`, `homebox_upload_attachment`) when `homebox_api_surface` returns `items`; entity tools are for the newer Entity Merge API.
-- `homebox_update_item` reads the current item, merges `patch`, preserves fields/tags/location, and PUTs a full payload because partial PUT can fail.
-- Homebox v0.25 may ignore some fields on item creation. If fields such as `purchaseTime`, `purchaseFrom`, `manufacturer` or `modelNumber` matter, verify with `homebox_get_item` and patch missing fields.
+- `homebox_update_item` reads the current entity, merges `patch`, preserves fields/tags and converts `parent` to `parentId`, then PUTs a full payload because partial PUT can drop fields.
 - Homebox `assetId` may be auto-generated. External order IDs such as AliExpress `AE-*` should usually be stored in `notes` or custom fields unless overwriting `assetId` is known to work.
-- Large mixed update patches may cause Homebox 500. Prefer smaller patches when updating legacy v0.25 items.
 
 ## Tests
 

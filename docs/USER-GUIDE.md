@@ -21,25 +21,9 @@ When connected through MCP OAuth, do not pass `sessionKey` or raw `token`; those
 
 ## Choose Item Or Entity Tools
 
-Call `homebox_api_surface` when unsure.
+Homebox v0.26 unified items and locations into a single `/api/v1/entities/*` API. The item-named tools (`homebox_list_items`, `homebox_get_item`, `homebox_create_item`, `homebox_update_item`, `homebox_upload_attachment`) and entity-named tools (`homebox_list_entities`, `homebox_get_entity`, `homebox_create_entity`, `homebox_patch_entity`, `homebox_upload_entity_attachment`) all call `/api/v1/entities/*`. Use whichever family reads more naturally; both produce identical HTTP traffic.
 
-Use item tools when it returns `items`, which is legacy Homebox v0.25 behavior:
-
-- `homebox_list_items`
-- `homebox_get_item`
-- `homebox_create_item`
-- `homebox_update_item`
-- `homebox_upload_attachment`
-
-Use entity tools when it returns `entities`, which is the newer Entity Merge API:
-
-- `homebox_list_entities`
-- `homebox_get_entity`
-- `homebox_create_entity`
-- `homebox_patch_entity`
-- `homebox_upload_entity_attachment`
-
-Most item/entity tool families auto-route internally, but choosing the matching family keeps prompts and field names clearer.
+Locations are entities queried with `?isLocation=true`. Use `parentId` for the parent location (not `locationId`, which is a legacy field name retained only as a workflow alias).
 
 ## Homebox UI Field Mapping
 
@@ -54,23 +38,24 @@ Use API field names in tool payloads.
 | Model | `modelNumber` |
 | Serial number / Numer seryjny | `serialNumber` |
 | Notes / Notatki | `notes` |
-| Location / Lokalizacja | `locationId` |
+| Location / Lokalizacja | `parentId` |
 | Tags / Tagi | `tagIds` |
 | Primary photo / thumbnail | primary attachment or `imageId` |
 
 Use `purchaseTime` for purchase date. Do not use `purchaseDate`.
 
-## Safe Homebox v0.25 Updates
+## Safe Entity Updates
 
-Homebox v0.25 can fail partial `PUT /items/{id}` with `500 Unknown Error`. Use `homebox_update_item` for partial updates. It reads the current item, merges `patch`, preserves custom fields/tags/location, then sends a full PUT payload.
+`PUT /entities/{id}` requires a full entity payload. Use `homebox_update_item` for partial updates. It reads the current entity, merges `patch`, preserves custom fields/tags and converts `parent` to `parentId`, then sends a full PUT payload.
 
-Supported `patch` fields for v0.25 items include:
+Supported `patch` fields for v0.26 entities include:
 
 ```text
 name, description, quantity, insured, archived, assetId, serialNumber,
 modelNumber, manufacturer, lifetimeWarranty, warrantyExpires,
 warrantyDetails, purchaseTime, purchaseFrom, purchasePrice,
-soldTime, soldTo, soldPrice, soldNotes, notes, locationId, tagIds, fields
+soldTime, soldTo, soldPrice, soldNotes, notes, parentId, entityTypeId,
+tagIds, fields, syncChildEntityLocations
 ```
 
 Example:
@@ -78,7 +63,7 @@ Example:
 ```json
 {
   "sessionKey": "session-123",
-  "itemId": "item-uuid",
+  "itemId": "entity-uuid",
   "patch": {
     "purchaseTime": "2026-05-17",
     "purchaseFrom": "AliExpress",
@@ -90,11 +75,7 @@ Example:
 }
 ```
 
-Homebox v0.25 may ignore some fields during item creation. If purchase or manufacturer/model fields matter, verify with `homebox_get_item` and patch missing fields.
-
 Homebox `assetId` may be auto-generated. Store external order IDs such as AliExpress `AE-*` in `notes` or custom fields unless overwriting `assetId` is intentional and verified.
-
-Large mixed update patches may cause Homebox 500. Prefer smaller patches when updating legacy v0.25 items.
 
 ## Recommended Purchase Import Workflow
 
@@ -106,10 +87,10 @@ Manual workflow when needed:
 
 1. Resolve location by name with `homebox_resolve_location` or `homebox_find_or_create_location`.
 2. Resolve or create tags with `homebox_resolve_tags`.
-3. Create an item with stable fields: `name`, `description`, `quantity`, `locationId`, `tagIds`.
+3. Create an entity with stable fields: `name`, `description`, `quantity`, `parentId`, `tagIds`.
 4. Patch purchase and detail fields: `purchasePrice`, `purchaseTime`, `purchaseFrom`, `manufacturer`, `modelNumber`, `notes`.
 5. Upload the primary photo.
-6. Verify final fields with `homebox_get_item`.
+6. Verify final fields with `homebox_get_entity`.
 
 ## Create One Full Item
 

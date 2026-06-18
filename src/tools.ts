@@ -42,7 +42,7 @@ const base64FileInput = {
 };
 
 const itemUiApiMapping = [
-  "Homebox UI to API field mapping:",
+  "Homebox UI to API field mapping (v0.26 Entity Merge API):",
   "- Purchase date / Data zakupu -> purchaseTime",
   "- Purchased from / Zakupiono od -> purchaseFrom",
   "- Purchase price / Cena zakupu -> purchasePrice",
@@ -50,36 +50,38 @@ const itemUiApiMapping = [
   "- Model -> modelNumber",
   "- Serial number / Numer seryjny -> serialNumber",
   "- Notes / Notatki -> notes",
-  "- Location / Lokalizacja -> locationId",
+  "- Location / Lokalizacja -> parentId (parent entity, typically a location-type entity)",
   "- Tags / Tagi -> tagIds",
   "- Primary photo / thumbnail -> primary attachment or imageId",
-  "Use purchaseTime for purchase date. Do not use purchaseDate.",
+  "Use purchaseTime for purchase date. Do not use purchaseDate. Use parentId for parent location.",
 ].join("\n");
 
-const legacyItemPatchFields = [
-  "Supported patch fields for Homebox v0.25 items:",
+const entityPatchFields = [
+  "Supported fields for Homebox v0.26 entities:",
   "name, description, quantity, insured, archived, assetId, serialNumber,",
   "modelNumber, manufacturer, lifetimeWarranty, warrantyExpires,",
   "warrantyDetails, purchaseTime, purchaseFrom, purchasePrice,",
-  "soldTime, soldTo, soldPrice, soldNotes, notes, locationId, tagIds, fields.",
+  "soldTime, soldTo, soldPrice, soldNotes, notes, parentId, entityTypeId,",
+  "tagIds, fields, syncChildEntityLocations.",
 ].join("\n");
 
-const legacyV025Notes = [
-  "Homebox v0.25 notes:",
-  "- Item update uses GET, merges patch, then PUTs full payload because partial PUT can fail.",
-  "- Homebox v0.25 may ignore some fields on create; verify important fields with homebox_get_item and patch missing fields.",
-  "- Homebox assetId may be auto-generated; external order IDs usually belong in notes or custom fields unless overwriting assetId is known to work.",
-  "- Large mixed update patches may cause Homebox 500; prefer smaller patches for legacy v0.25 items.",
+const v026Notes = [
+  "Homebox v0.26 notes:",
+  "- Items and locations are unified as entities via /api/v1/entities. Use parentId for parent location.",
+  "- Use entityTypeId to control whether an entity is an item or location; query /api/v1/entity-types.",
+  "- PATCH /entities/{id} supports entityTypeId, parentId, quantity and tagIds.",
+  "- PUT /entities/{id} replaces the full entity; GET before PUT and merge to avoid field loss.",
+  "- assetId may be auto-generated; external order IDs usually belong in notes or custom fields unless overwriting assetId is intended.",
 ].join("\n");
 
 const purchaseImportWorkflow = [
   "Recommended purchase/import workflow:",
-  "1. Resolve location by name.",
+  "1. Resolve location by name (locations are entities with isLocation=true).",
   "2. Resolve or create tags.",
-  "3. Create item with stable fields: name, description, quantity, locationId, tagIds.",
+  "3. Create entity with stable fields: name, description, quantity, parentId, tagIds.",
   "4. Patch purchasePrice, purchaseTime, purchaseFrom, manufacturer, modelNumber, notes.",
   "5. Upload primary photo.",
-  "6. Verify with homebox_get_item.",
+  "6. Verify with homebox_get_entity.",
 ].join("\n");
 
 const itemPayloadFields = {
@@ -88,7 +90,7 @@ const itemPayloadFields = {
   quantity: z.number().positive().optional(),
   insured: z.boolean().optional(),
   archived: z.boolean().optional(),
-  assetId: z.string().min(1).optional().describe("Homebox asset ID. May be auto-generated on v0.25; do not store external order IDs here unless intended."),
+  assetId: z.string().min(1).optional().describe("Homebox asset ID. May be auto-generated; do not store external order IDs here unless intended."),
   serialNumber: z.string().min(1).optional(),
   modelNumber: z.string().min(1).optional().describe("Homebox UI: Model."),
   manufacturer: z.string().min(1).optional().describe("Homebox UI: Manufacturer / Producent."),
@@ -103,8 +105,8 @@ const itemPayloadFields = {
   soldPrice: z.number().nonnegative().optional(),
   soldNotes: z.string().min(1).optional(),
   notes: z.string().min(1).optional().describe("Homebox UI: Notes / Notatki."),
-  locationId: z.string().min(1).optional().describe("Homebox v0.25 location ID. New Entity API parentId is translated by this MCP client."),
-  parentId: z.string().min(1).optional().describe("New Entity API parent/location ID. Translated to locationId on legacy v0.25."),
+  locationId: z.string().min(1).optional().describe("Alias for parentId (parent entity ID, typically a location-type entity)."),
+  parentId: z.string().min(1).optional().describe("Parent entity ID (location). Required for items inside a location."),
   tagIds: z.array(z.string().min(1)).optional().describe("Homebox tag IDs. Resolve names with homebox_resolve_tags first."),
   fields: z.array(jsonObject).optional().describe("Custom fields. homebox_update_item preserves existing fields and merges by id/name."),
   syncChildItemsLocations: z.boolean().optional(),
@@ -114,7 +116,6 @@ const itemCreateBody = z.object({ ...itemPayloadFields, name: z.string().min(1).
 const itemPatchBody = z.object(itemPayloadFields).passthrough();
 
 const arrayDataOutput = { data: z.array(z.unknown()) };
-const apiSurfaceOutput = { surface: z.enum(["items", "entities"]), cached: z.boolean() };
 const publicSessionOutput = {
   sessionKey: z.string(),
   username: z.string().optional(),
@@ -238,29 +239,12 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     "homebox_list_currencies",
     {
       title: "List Homebox Currencies",
-      description: "List available Homebox currencies via /api/v1/currency. Current Homebox docs describe this as GET /v1/currency.",
+      description: "List available Homebox currencies via GET /api/v1/currencies.",
       inputSchema: { ...authInput },
       outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listCurrencies(optionalTokenFrom(args, state)), "Currencies loaded"),
-  );
-
-  server.registerTool(
-    "homebox_api_surface",
-    {
-      title: "Detect Homebox API Surface",
-      description: "Probe the connected Homebox instance to detect which API version is available: 'entities' (new Entity Merge API) or 'items' (legacy v0.25.0). Result is cached per server process.",
-      inputSchema: { ...authInput },
-      outputSchema: apiSurfaceOutput,
-      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
-    },
-    (args) =>
-      toolResult(async () => {
-        const token = tokenFrom(args, state);
-        const surface = await state.homebox.getApiSurface(token);
-        return { surface, cached: state.homebox.currentApiSurface() === surface };
-      }, "API surface detected"),
   );
 
   server.registerTool(
@@ -358,7 +342,7 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     "homebox_list_items",
     {
       title: "List Homebox Items",
-      description: "List Homebox items with pagination and optional collection/group filter. Prefer item tools when homebox_api_surface returns 'items' for Homebox v0.25. This MCP client auto-routes item tools to the newer entities surface when needed.",
+      description: "List Homebox items (non-location entities) via /api/v1/entities with pagination and optional collection/group filter. Accepts page, pageSize, collectionId (sent as groupId) and extra query parameters.",
       inputSchema: {
         ...authInput,
         page: z.number().int().positive().optional(),
@@ -379,11 +363,11 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     "homebox_get_item",
     {
       title: "Get Homebox Item",
-      description: "Get full Homebox item detail by ID. Use this after create/update to verify important Homebox v0.25 fields such as purchaseTime, purchaseFrom, manufacturer, modelNumber and notes.",
+      description: "Get full Homebox entity detail by ID. Use this after create/update to verify important fields such as purchaseTime, purchaseFrom, manufacturer, modelNumber and notes.",
       inputSchema: { ...authInput, itemId },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
-    (args) => toolResult(() => state.homebox.getItem(tokenFrom(args, state), args.itemId), "Item loaded"),
+    (args) => toolResult(() => state.homebox.getItem(tokenFrom(args, state), args.itemId), "Entity loaded"),
   );
 
   server.registerTool(
@@ -391,32 +375,32 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     {
       title: "Create Homebox Item",
       description: [
-        "Low-level create via /api/v1/items or translated /api/v1/entities.",
-        "Required: body Homebox item create payload. For natural-language purchase/import workflows, prefer homebox_create_item_full or homebox_upsert_items_bulk.",
+        "Low-level create via POST /api/v1/entities.",
+        "Required: body Homebox entity create payload. For natural-language purchase/import workflows, prefer homebox_create_item_full or homebox_upsert_items_bulk.",
         itemUiApiMapping,
-        legacyV025Notes,
+        v026Notes,
       ].join("\n\n"),
-      inputSchema: { ...authInput, body: itemCreateBody.describe("Homebox item create payload. Unknown Homebox fields are passed through.") },
+      inputSchema: { ...authInput, body: itemCreateBody.describe("Homebox entity create payload. Unknown Homebox fields are passed through.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    (args) => toolResult(() => state.homebox.createItem(tokenFrom(args, state), args.body as JsonObject), "Item created"),
+    (args) => toolResult(() => state.homebox.createItem(tokenFrom(args, state), args.body as JsonObject), "Entity created"),
   );
 
-  server.registerTool(
+    server.registerTool(
     "homebox_update_item",
     {
       title: "Update Homebox Item Safely",
       description: [
-        "Update an item by reading current item, merging patch, and PUT-ing full payload. Preserves fields/tags and converts location to locationId.",
-        "Required: itemId Homebox item UUID; patch partial item fields to update.",
-        legacyItemPatchFields,
+        "Update an entity by reading current entity, merging patch, and PUT-ing full payload. Preserves fields/tags and converts parent to parentId.",
+        "Required: itemId Homebox entity UUID; patch partial entity fields to update.",
+        entityPatchFields,
         itemUiApiMapping,
-        legacyV025Notes,
+        v026Notes,
       ].join("\n\n"),
-      inputSchema: { ...authInput, itemId, patch: itemPatchBody.describe("Partial item fields to merge into current item. Use purchaseTime, not purchaseDate.") },
+      inputSchema: { ...authInput, itemId, patch: itemPatchBody.describe("Partial entity fields to merge into current entity. Use purchaseTime, not purchaseDate. Use parentId for location.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    (args) => toolResult(() => state.homebox.updateItem(tokenFrom(args, state), args.itemId, args.patch as JsonObject), "Item updated"),
+    (args) => toolResult(() => state.homebox.updateItem(tokenFrom(args, state), args.itemId, args.patch as JsonObject), "Entity updated"),
   );
 
   server.registerTool(
@@ -424,36 +408,36 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     {
       title: "Replace Homebox Item",
       description: [
-        "Direct PUT /api/v1/items/{id}. Caller must provide full Homebox payload; use homebox_update_item for safe partial updates.",
-        "On Homebox v0.25, partial PUT can fail with server 500 and can drop fields/tags. Prefer homebox_update_item unless replacing the full object intentionally.",
+        "Direct PUT /api/v1/entities/{id}. Caller must provide full entity payload; use homebox_update_item for safe partial updates.",
+        "Partial PUT can drop fields/tags. Prefer homebox_update_item unless replacing the full object intentionally.",
         itemUiApiMapping,
       ].join("\n\n"),
-      inputSchema: { ...authInput, itemId, body: jsonObject.describe("Full Homebox item payload.") },
+      inputSchema: { ...authInput, itemId, body: jsonObject.describe("Full Homebox entity payload.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    (args) => toolResult(() => state.homebox.putItem(tokenFrom(args, state), args.itemId, args.body as JsonObject), "Item replaced"),
+    (args) => toolResult(() => state.homebox.putItem(tokenFrom(args, state), args.itemId, args.body as JsonObject), "Entity replaced"),
   );
 
   server.registerTool(
     "homebox_patch_item",
     {
       title: "Patch Homebox Item",
-      description: "Direct PATCH /api/v1/items/{id}. Behavior depends on Homebox version. For legacy Homebox v0.25 item updates, prefer homebox_update_item because it GET-merges and PUTs a safe full payload.",
+      description: "Direct PATCH /api/v1/entities/{id}. Supports entityTypeId, parentId, quantity and tagIds. For broader updates prefer homebox_update_item which GET-merges and PUTs a safe full payload.",
       inputSchema: { ...authInput, itemId, patch: jsonObject },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    (args) => toolResult(() => state.homebox.patchItem(tokenFrom(args, state), args.itemId, args.patch as JsonObject), "Item patched"),
+    (args) => toolResult(() => state.homebox.patchItem(tokenFrom(args, state), args.itemId, args.patch as JsonObject), "Entity patched"),
   );
 
   server.registerTool(
     "homebox_delete_item",
     {
       title: "Delete Homebox Item",
-      description: "Delete a Homebox item by ID.",
+      description: "Delete a Homebox entity by ID.",
       inputSchema: { ...authInput, itemId },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
-    (args) => toolResult(() => state.homebox.deleteItem(tokenFrom(args, state), args.itemId), "Item deleted"),
+    (args) => toolResult(() => state.homebox.deleteItem(tokenFrom(args, state), args.itemId), "Entity deleted"),
   );
 
   registerEntityTools(server, state);
@@ -462,6 +446,12 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
   registerLocationAndFieldTools(server, state);
   registerMaintenanceTools(server, state);
   registerNotifierTools(server, state);
+  registerTagTools(server, state);
+  registerGroupTools(server, state);
+  registerActionsTools(server, state);
+  registerReportingTools(server, state);
+  registerUserTools(server, state);
+  registerBarcodeAssetTools(server, state);
   registerGenericRequestTool(server, state);
 }
 
@@ -472,7 +462,7 @@ function registerMaintenanceTools(server: McpServer, state: ToolState): void {
     "homebox_list_maintenance",
     {
       title: "List Maintenance",
-      description: "Query maintenance log across all items via GET /api/v1/maintenance. Defaults to status=both when not provided to avoid v0.25.0 500 error.",
+      description: "Query maintenance log across all entities via GET /api/v1/maintenance. Defaults to status=both when not provided.",
       inputSchema: { ...authInput, status: z.enum(["scheduled", "completed", "both"]).optional() },
       outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -568,21 +558,27 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
     "homebox_list_entities",
     {
       title: "List Entities",
-      description: "Query entities via /api/v1/entities. Use entity tools when homebox_api_surface returns 'entities' for the new Entity Merge API. For Homebox v0.25 ('items' surface), prefer item tools: homebox_list_items, homebox_get_item, homebox_update_item, homebox_upload_attachment.",
+      description: "Query Homebox entities via /api/v1/entities. Pass isLocation=true to list locations. Use parentIds to filter by parent entity. Supports q, tags, negateTags, orderBy, includeArchived, fields filter.",
       inputSchema: {
         ...authInput,
         q: z.string().min(1).optional().describe("Search string."),
         page: z.number().int().positive().optional(),
         pageSize: z.number().int().positive().max(500).optional(),
-        tags: z.array(z.string().min(1)).optional().describe("Tag IDs."),
+        tags: z.array(z.string().min(1)).optional().describe("Tag IDs to filter by."),
         parentIds: z.array(z.string().min(1)).optional().describe("Parent entity IDs."),
+        isLocation: z.boolean().optional().describe("true returns locations only; omit/false for items only."),
+        filterChildren: z.boolean().optional().describe("When isLocation=true, return only root locations."),
+        negateTags: z.boolean().optional().describe("Exclude entities matching the given tags."),
+        orderBy: z.string().min(1).optional().describe("Sort field: name, createdAt, updatedAt."),
+        includeArchived: z.boolean().optional().describe("Include archived entities."),
+        fields: z.array(z.string().min(1)).optional().describe("Filter by custom field values in fieldName=value format."),
         query: z.record(z.string(), queryValue).optional().describe("Additional Homebox query parameters."),
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) =>
       toolResult(
-        () => state.homebox.listEntities(tokenFrom(args, state), args as { q?: string; page?: number; pageSize?: number; tags?: string[]; parentIds?: string[]; query?: Record<string, QueryValue> }),
+        () => state.homebox.listEntities(tokenFrom(args, state), args as Parameters<typeof state.homebox.listEntities>[1]),
         "Entities loaded",
       ),
   );
@@ -591,7 +587,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
     "homebox_create_entity",
     {
       title: "Create Entity",
-      description: "Create an entity via POST /api/v1/entities. Use only for the newer Entity Merge API; for Homebox v0.25 items surface prefer homebox_create_item_full or homebox_create_item.",
+      description: "Create an entity via POST /api/v1/entities. For natural-language purchase/import workflows, prefer homebox_create_item_full or homebox_upsert_items_bulk.",
       inputSchema: { ...authInput, body: jsonObject.describe("Entity create payload.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -671,7 +667,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
     "homebox_get_entity",
     {
       title: "Get Entity",
-      description: "Get entity detail via GET /api/v1/entities/{id}. Use when homebox_api_surface returns 'entities'; for Homebox v0.25 use homebox_get_item.",
+      description: "Get entity detail via GET /api/v1/entities/{id}.",
       inputSchema: { ...authInput, entityId },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
@@ -682,7 +678,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
     "homebox_put_entity",
     {
       title: "Replace Entity",
-      description: "Direct PUT /api/v1/entities/{id}. Caller must provide Homebox entity payload. Use entity tools only on the newer entities surface; for Homebox v0.25 use item tools.",
+      description: "Direct PUT /api/v1/entities/{id}. Caller must provide Homebox entity payload. Use homebox_update_item for safe partial updates.",
       inputSchema: { ...authInput, entityId, body: jsonObject.describe("Entity update payload.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -693,7 +689,7 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
     "homebox_patch_entity",
     {
       title: "Patch Entity",
-      description: "PATCH /api/v1/entities/{id}. Current docs support entityTypeId, parentId, quantity and tagIds. Use when homebox_api_surface returns 'entities'; for Homebox v0.25 use homebox_update_item.",
+      description: "PATCH /api/v1/entities/{id}. Supports entityTypeId, parentId, quantity and tagIds. For broader updates prefer homebox_update_item which GET-merges and PUTs a safe full payload.",
       inputSchema: { ...authInput, entityId, patch: jsonObject.describe("Entity patch payload.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -1106,7 +1102,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
         "Workflow create: resolves tags/location, stores external refs as custom fields, creates item, then optionally uploads a primary photo from a public URL.",
         "Accepted item fields include name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. photoUrl must be a direct image file URL (image/jpeg, image/png or image/webp) — do NOT pass product page URLs; store those in sourceUrls instead. Local photo paths are not supported.",
         itemUiApiMapping,
-        legacyV025Notes,
+        v026Notes,
         purchaseImportWorkflow,
       ].join("\n\n"),
       inputSchema: { ...authInput, ...itemWorkflowInput },
@@ -1173,7 +1169,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
         "Create/update many purchase/import items in one call. Dedupe defaults to External Asset ID, Order ID, then name. Resolves location/tags, stores external refs as custom fields, uploads direct image file URLs as photos, and returns a report.",
         "Each item accepts name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. photoUrl must be a direct image file URL (image/jpeg, image/png or image/webp) — do NOT pass product page URLs; store those in sourceUrls instead. Local photo paths are not supported.",
         itemUiApiMapping,
-        legacyV025Notes,
+        v026Notes,
       ].join("\n\n"),
       inputSchema: {
         ...authInput,
@@ -1199,7 +1195,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
         "Import many purchase items in one call, optimized for sources such as AliExpress orders. Alias for homebox_upsert_items_bulk; prefer this over manual orchestration.",
         "Each item accepts name, description, quantity, purchaseTime, purchaseFrom, purchasePrice, manufacturer, modelNumber, serialNumber, notes, labels, externalAssetId, orderId, sourceUrls and photoUrl. photoUrl must be a direct image file URL (image/jpeg, image/png or image/webp) — do NOT pass product page URLs; store those in sourceUrls instead. Local photo paths are not supported.",
         itemUiApiMapping,
-        legacyV025Notes,
+        v026Notes,
       ].join("\n\n"),
       inputSchema: {
         ...authInput,
@@ -1291,12 +1287,513 @@ function registerLocationAndFieldTools(server: McpServer, state: ToolState): voi
     "homebox_list_custom_field_values",
     {
       title: "List Custom Field Values",
-      description: "List distinct values for one Homebox custom field. Homebox v0.25.0 requires the field query parameter.",
+      description: "List distinct values for one Homebox custom field. The field query parameter is required.",
       inputSchema: { ...authInput, field: z.string().min(1).describe("Custom field name, e.g. one value from homebox_list_custom_fields.") },
       outputSchema: arrayDataOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.listCustomFieldValues(tokenFrom(args, state), args.field), "Custom field values loaded"),
+  );
+}
+
+function registerTagTools(server: McpServer, state: ToolState): void {
+  const tagId = z.string().min(1).describe("Homebox tag ID.");
+
+  server.registerTool(
+    "homebox_get_tag",
+    {
+      title: "Get Tag",
+      description: "Get a Homebox tag by ID via GET /api/v1/tags/{id}.",
+      inputSchema: { ...authInput, tagId },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.getTag(tokenFrom(args, state), args.tagId), "Tag loaded"),
+  );
+
+  server.registerTool(
+    "homebox_update_tag",
+    {
+      title: "Update Tag",
+      description: "Update a Homebox tag via PUT /api/v1/tags/{id}. Payload may include name, color, icon, parentId.",
+      inputSchema: { ...authInput, tagId, body: jsonObject.describe("Tag update payload.") },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.updateTag(tokenFrom(args, state), args.tagId, args.body as JsonObject), "Tag updated"),
+  );
+
+  server.registerTool(
+    "homebox_delete_tag",
+    {
+      title: "Delete Tag",
+      description: "Delete a Homebox tag by ID via DELETE /api/v1/tags/{id}.",
+      inputSchema: { ...authInput, tagId },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.deleteTag(tokenFrom(args, state), args.tagId), "Tag deleted"),
+  );
+}
+
+function registerGroupTools(server: McpServer, state: ToolState): void {
+  const groupId = z.string().min(1).describe("Homebox group/collection ID.");
+  const invitationId = z.string().min(1).describe("Homebox group invitation ID.");
+  const userId = z.string().min(1).describe("Homebox user ID.");
+
+  server.registerTool(
+    "homebox_get_group",
+    {
+      title: "Get Group",
+      description: "Get the current Homebox group/collection via GET /api/v1/groups.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.getGroup(tokenFrom(args, state)), "Group loaded"),
+  );
+
+  server.registerTool(
+    "homebox_update_group",
+    {
+      title: "Update Group",
+      description: "Update the current Homebox group/collection via PUT /api/v1/groups. Payload: name, currency, etc.",
+      inputSchema: { ...authInput, body: jsonObject.describe("Group update payload.") },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.updateGroup(tokenFrom(args, state), args.body as JsonObject), "Group updated"),
+  );
+
+  server.registerTool(
+    "homebox_create_group",
+    {
+      title: "Create Group",
+      description: "Create a new Homebox group/collection via POST /api/v1/groups.",
+      inputSchema: { ...authInput, body: jsonObject.describe("Group create payload: name, currency.") },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.createGroup(tokenFrom(args, state), args.body as JsonObject), "Group created"),
+  );
+
+  server.registerTool(
+    "homebox_delete_group",
+    {
+      title: "Delete Group",
+      description: "Delete the current Homebox group/collection via DELETE /api/v1/groups. Irreversible.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.deleteGroup(tokenFrom(args, state)), "Group deleted"),
+  );
+
+  server.registerTool(
+    "homebox_list_group_invitations",
+    {
+      title: "List Group Invitations",
+      description: "List pending invitations for the current Homebox group via GET /api/v1/groups/invitations.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.listGroupInvitations(tokenFrom(args, state)), "Group invitations loaded"),
+  );
+
+  server.registerTool(
+    "homebox_create_group_invitation",
+    {
+      title: "Create Group Invitation",
+      description: "Create a group invitation via POST /api/v1/groups/invitations.",
+      inputSchema: { ...authInput, body: jsonObject.describe("Invitation payload.") },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.createGroupInvitation(tokenFrom(args, state), args.body as JsonObject), "Group invitation created"),
+  );
+
+  server.registerTool(
+    "homebox_accept_group_invitation",
+    {
+      title: "Accept Group Invitation",
+      description: "Accept a group invitation via POST /api/v1/groups/invitations/{id}.",
+      inputSchema: { ...authInput, invitationId, body: jsonObject.optional() },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.acceptGroupInvitation(tokenFrom(args, state), args.invitationId, args.body as JsonObject | undefined), "Group invitation accepted"),
+  );
+
+  server.registerTool(
+    "homebox_delete_group_invitation",
+    {
+      title: "Delete Group Invitation",
+      description: "Delete a group invitation via DELETE /api/v1/groups/invitations/{id}.",
+      inputSchema: { ...authInput, invitationId },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.deleteGroupInvitation(tokenFrom(args, state), args.invitationId), "Group invitation deleted"),
+  );
+
+  server.registerTool(
+    "homebox_list_group_members",
+    {
+      title: "List Group Members",
+      description: "List members of the current Homebox group via GET /api/v1/groups/members.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.listGroupMembers(tokenFrom(args, state)), "Group members loaded"),
+  );
+
+  server.registerTool(
+    "homebox_remove_group_member",
+    {
+      title: "Remove Group Member",
+      description: "Remove a user from the current Homebox group via DELETE /api/v1/groups/members/{userId}.",
+      inputSchema: { ...authInput, userId },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.removeGroupMember(tokenFrom(args, state), args.userId), "Group member removed"),
+  );
+
+  server.registerTool(
+    "homebox_list_group_statistics",
+    {
+      title: "List Group Statistics",
+      description: "Get statistics for the current Homebox group via GET /api/v1/groups/statistics.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.listGroupStatistics(tokenFrom(args, state)), "Group statistics loaded"),
+  );
+
+  server.registerTool(
+    "homebox_list_location_statistics",
+    {
+      title: "List Location Statistics",
+      description: "Get location statistics for the current Homebox group via GET /api/v1/groups/statistics/locations.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.listLocationStatistics(tokenFrom(args, state)), "Location statistics loaded"),
+  );
+
+  server.registerTool(
+    "homebox_list_purchase_price_statistics",
+    {
+      title: "List Purchase Price Statistics",
+      description: "Get purchase price statistics for the current Homebox group via GET /api/v1/groups/statistics/purchase-price.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.listPurchasePriceStatistics(tokenFrom(args, state)), "Purchase price statistics loaded"),
+  );
+
+  server.registerTool(
+    "homebox_list_tag_statistics",
+    {
+      title: "List Tag Statistics",
+      description: "Get tag statistics for the current Homebox group via GET /api/v1/groups/statistics/tags.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.listTagStatistics(tokenFrom(args, state)), "Tag statistics loaded"),
+  );
+
+  server.registerTool(
+    "homebox_list_group_exports",
+    {
+      title: "List Group Exports",
+      description: "List collection export jobs for the current Homebox group via GET /api/v1/group/exports.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.listGroupExports(tokenFrom(args, state)), "Group exports loaded"),
+  );
+
+  server.registerTool(
+    "homebox_start_group_export",
+    {
+      title: "Start Group Export",
+      description: "Start a collection ZIP export job via POST /api/v1/group/exports. Includes attachments, tags and entities.",
+      inputSchema: { ...authInput, body: jsonObject.optional() },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.startGroupExport(tokenFrom(args, state), args.body as JsonObject | undefined), "Group export started"),
+  );
+
+  server.registerTool(
+    "homebox_get_group_export",
+    {
+      title: "Get Group Export",
+      description: "Get a collection export job status via GET /api/v1/group/exports/{id}.",
+      inputSchema: { ...authInput, exportId: z.string().min(1).describe("Homebox group export job ID.") },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.getGroupExport(tokenFrom(args, state), args.exportId), "Group export loaded"),
+  );
+
+  server.registerTool(
+    "homebox_delete_group_export",
+    {
+      title: "Delete Group Export",
+      description: "Delete a collection export job via DELETE /api/v1/group/exports/{id}.",
+      inputSchema: { ...authInput, exportId: z.string().min(1).describe("Homebox group export job ID.") },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.deleteGroupExport(tokenFrom(args, state), args.exportId), "Group export deleted"),
+  );
+
+  server.registerTool(
+    "homebox_download_group_export_artifact",
+    {
+      title: "Download Group Export Artifact",
+      description: "Download a collection export ZIP artifact via GET /api/v1/group/exports/{id}/download. Returns base64 within configured size limit.",
+      inputSchema: { ...authInput, exportId: z.string().min(1).describe("Homebox group export job ID.") },
+      outputSchema: downloadedFileOutput,
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.downloadGroupExportArtifact(tokenFrom(args, state), args.exportId), "Group export artifact downloaded"),
+  );
+
+  server.registerTool(
+    "homebox_import_group_zip",
+    {
+      title: "Import Group ZIP",
+      description: "Import a collection ZIP (entities, attachments, tags) into the current group via POST /api/v1/group/import. Receiving collection must be empty.",
+      inputSchema: { ...authInput, ...base64FileInput },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    (args) =>
+      toolResult(
+        () => state.homebox.importGroupZip({ token: tokenFrom(args, state), fileName: args.fileName, base64: args.base64, contentType: args.contentType }),
+        "Group ZIP imported",
+      ),
+  );
+}
+
+function registerActionsTools(server: McpServer, state: ToolState): void {
+  server.registerTool(
+    "homebox_action_create_missing_thumbnails",
+    {
+      title: "Create Missing Thumbnails",
+      description: "Trigger thumbnail generation for attachments missing them via POST /api/v1/actions/create-missing-thumbnails.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.createMissingThumbnails(tokenFrom(args, state)), "Action completed"),
+  );
+
+  server.registerTool(
+    "homebox_action_ensure_asset_ids",
+    {
+      title: "Ensure Asset IDs",
+      description: "Assign asset IDs to entities that are missing them via POST /api/v1/actions/ensure-asset-ids.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.ensureAssetIds(tokenFrom(args, state)), "Action completed"),
+  );
+
+  server.registerTool(
+    "homebox_action_ensure_import_refs",
+    {
+      title: "Ensure Import Refs",
+      description: "Assign import refs to entities that are missing them via POST /api/v1/actions/ensure-import-refs.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.ensureImportRefs(tokenFrom(args, state)), "Action completed"),
+  );
+
+  server.registerTool(
+    "homebox_action_set_primary_photos",
+    {
+      title: "Set Primary Photos",
+      description: "Promote the first photo attachment to primary when no primary is set, via POST /api/v1/actions/set-primary-photos.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.setPrimaryPhotos(tokenFrom(args, state)), "Action completed"),
+  );
+
+  server.registerTool(
+    "homebox_action_wipe_inventory",
+    {
+      title: "Wipe Inventory",
+      description: "DANGEROUS. Wipe the inventory of the current group via POST /api/v1/actions/wipe-inventory. Optionally wipe labels/locations/maintenance via the body. Irreversible.",
+      inputSchema: { ...authInput, body: jsonObject.optional().describe("Wipe options: wipeLabels, wipeLocations, wipeMaintenance (booleans).") },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.wipeInventory(tokenFrom(args, state), args.body as JsonObject | undefined), "Inventory wiped"),
+  );
+
+  server.registerTool(
+    "homebox_action_zero_item_time_fields",
+    {
+      title: "Zero Out Time Fields",
+      description: "Zero out empty time fields on entities via POST /api/v1/actions/zero-item-time-fields.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.zeroItemTimeFields(tokenFrom(args, state)), "Action completed"),
+  );
+}
+
+function registerReportingTools(server: McpServer, state: ToolState): void {
+  server.registerTool(
+    "homebox_bill_of_materials",
+    {
+      title: "Export Bill of Materials",
+      description: "Export the bill of materials for the current group via GET /api/v1/reporting/bill-of-materials. Returns base64 (and text when textual).",
+      inputSchema: { ...authInput },
+      outputSchema: downloadedFileOutput,
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.billOfMaterials(tokenFrom(args, state)), "Bill of materials exported"),
+  );
+}
+
+function registerUserTools(server: McpServer, state: ToolState): void {
+  const apiKeyId = z.string().min(1).describe("Homebox API key ID.");
+
+  server.registerTool(
+    "homebox_logout_homebox",
+    {
+      title: "Logout Homebox Token",
+      description: "Logout the current Homebox user token on the Homebox server via POST /api/v1/users/logout. Does not remove the local MCP session; use homebox_logout for that.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.logout(tokenFrom(args, state)), "Homebox token logged out"),
+  );
+
+  server.registerTool(
+    "homebox_get_user_self",
+    {
+      title: "Get User Self",
+      description: "Get the current Homebox user via GET /api/v1/users/self.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.getUserSelf(tokenFrom(args, state)), "User loaded"),
+  );
+
+  server.registerTool(
+    "homebox_update_user_self",
+    {
+      title: "Update User Self",
+      description: "Update the current Homebox user via PUT /api/v1/users/self.",
+      inputSchema: { ...authInput, body: jsonObject.describe("User update payload: name, email, etc.") },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.updateUserSelf(tokenFrom(args, state), args.body as JsonObject), "User updated"),
+  );
+
+  server.registerTool(
+    "homebox_delete_user_self",
+    {
+      title: "Delete User Self",
+      description: "DANGEROUS. Delete the current Homebox user account via DELETE /api/v1/users/self. Irreversible.",
+      inputSchema: { ...authInput, body: jsonObject.optional() },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.deleteUserSelf(tokenFrom(args, state), args.body as JsonObject | undefined), "User account deleted"),
+  );
+
+  server.registerTool(
+    "homebox_get_user_settings",
+    {
+      title: "Get User Settings",
+      description: "Get the current Homebox user settings via GET /api/v1/users/self/settings.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.getUserSettings(tokenFrom(args, state)), "User settings loaded"),
+  );
+
+  server.registerTool(
+    "homebox_update_user_settings",
+    {
+      title: "Update User Settings",
+      description: "Update the current Homebox user settings via PUT /api/v1/users/self/settings.",
+      inputSchema: { ...authInput, body: jsonObject.describe("User settings payload.") },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.updateUserSettings(tokenFrom(args, state), args.body as JsonObject), "User settings updated"),
+  );
+
+  server.registerTool(
+    "homebox_change_password",
+    {
+      title: "Change Password",
+      description: "Change the current Homebox user password via PUT /api/v1/users/change-password. Payload: currentPassword, newPassword.",
+      inputSchema: { ...authInput, body: jsonObject.describe("Password change payload: currentPassword, newPassword.") },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.changePassword(tokenFrom(args, state), args.body as JsonObject), "Password changed"),
+  );
+
+  server.registerTool(
+    "homebox_list_api_keys",
+    {
+      title: "List API Keys",
+      description: "List Homebox static API keys for the current user via GET /api/v1/users/self/api-keys. Keys are prefixed with hb_.",
+      inputSchema: { ...authInput },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.listApiKeys(tokenFrom(args, state)), "API keys loaded"),
+  );
+
+  server.registerTool(
+    "homebox_create_api_key",
+    {
+      title: "Create API Key",
+      description: "Create a Homebox static API key via POST /api/v1/users/self/api-keys. Each key takes on the access level of the creating user and is prefixed with hb_. Treat as a secret.",
+      inputSchema: { ...authInput, body: jsonObject.optional().describe("API key create payload: name, etc.") },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.createApiKey(tokenFrom(args, state), args.body as JsonObject | undefined), "API key created"),
+  );
+
+  server.registerTool(
+    "homebox_delete_api_key",
+    {
+      title: "Delete API Key",
+      description: "Delete a Homebox static API key by ID via DELETE /api/v1/users/self/api-keys/{id}.",
+      inputSchema: { ...authInput, apiKeyId },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.deleteApiKey(tokenFrom(args, state), args.apiKeyId), "API key deleted"),
+  );
+}
+
+function registerBarcodeAssetTools(server: McpServer, state: ToolState): void {
+  const assetIdParam = z.string().min(1).describe("Homebox asset ID (not entity UUID).");
+
+  server.registerTool(
+    "homebox_get_asset_by_asset_id",
+    {
+      title: "Get Entity By Asset ID",
+      description: "Get a Homebox entity by its asset ID via GET /api/v1/assets/{id}. Different from entity UUID.",
+      inputSchema: { ...authInput, assetId: assetIdParam },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.getAssetByAssetId(tokenFrom(args, state), args.assetId), "Asset loaded"),
+  );
+
+  server.registerTool(
+    "homebox_search_from_barcode",
+    {
+      title: "Search From Barcode",
+      description: "Look up product metadata by barcode/EAN via GET /api/v1/products/search-from-barcode?barcode=<barcode>. Uses configured barcode providers.",
+      inputSchema: { ...authInput, barcode: z.string().min(1).describe("EAN/barcode string.") },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.searchFromBarcode(tokenFrom(args, state), args.barcode), "Barcode lookup completed"),
+  );
+
+  server.registerTool(
+    "homebox_create_qr_code",
+    {
+      title: "Create QR Code",
+      description: "Generate a QR code for a Homebox entity via POST /api/v1/qrcode.",
+      inputSchema: { ...authInput, body: jsonObject.optional().describe("QR code payload: entityId, etc.") },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    (args) => toolResult(() => state.homebox.createQrCode(tokenFrom(args, state), args.body as JsonObject | undefined), "QR code created"),
   );
 }
 

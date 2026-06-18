@@ -124,15 +124,12 @@ describe.skipIf(!shouldRun)("real Homebox E2E over HTTP MCP", () => {
     await call(client, "homebox_logout", { sessionKey });
   });
 
-  it("auto-detects API surface and routes entities tools to legacy items endpoints", async () => {
+  it("confirms v0.26 entity, entity-type and currency endpoints", async () => {
     const login = await call(client, "homebox_login", {
       username: access.login,
       password: access.password,
     });
     const sessionKey = String(login.sessionKey);
-
-    const surface = await call(client, "homebox_api_surface", { sessionKey });
-    expect(surface).toMatchObject({ surface: "items" });
 
     const entities = await call(client, "homebox_list_entities", { sessionKey, pageSize: 5 });
     expect(entities).toHaveProperty("items");
@@ -141,13 +138,14 @@ describe.skipIf(!shouldRun)("real Homebox E2E over HTTP MCP", () => {
     const fieldNames = await call(client, "homebox_list_entity_field_names", { sessionKey });
     expect(Array.isArray(asArray(fieldNames))).toBe(true);
 
-    for (const tool of ["homebox_list_currencies", "homebox_list_entity_types"]) {
-      const result = (await client.callTool({ name: tool, arguments: { sessionKey } })) as CallToolResult;
-      expect(result.isError).toBe(true);
-      const structured = result.structuredContent as { kind?: string; status?: number } | undefined;
-      expect(structured?.kind).toBe("not_found");
-      expect(structured?.status).toBe(404);
-    }
+    const currencies = await call(client, "homebox_list_currencies", { sessionKey });
+    expect(Array.isArray(asArray(currencies))).toBe(true);
+
+    const entityTypes = await call(client, "homebox_list_entity_types", { sessionKey });
+    expect(Array.isArray(asArray(entityTypes))).toBe(true);
+
+    const groupStats = await call(client, "homebox_list_group_statistics", { sessionKey });
+    expect(groupStats).toBeDefined();
 
     await call(client, "homebox_logout", { sessionKey });
   });

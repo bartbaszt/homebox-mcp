@@ -198,7 +198,6 @@ export async function findOrCreateLocation(client: HomeboxClient, token: string,
   const createMissing = input.createMissing !== false;
   const dryRun = input.dryRun === true;
   const result: LocationResult = { path, created: false, matched: false, dryRun, toCreate: [] };
-  const surface = await client.getApiSurface(token);
   let locations = asRecords(await client.listLocations(token));
   let parentId = input.parentId;
   let current: JsonObject | undefined;
@@ -219,7 +218,8 @@ export async function findOrCreateLocation(client: HomeboxClient, token: string,
     result.toCreate.push(part);
     if (dryRun) return result;
 
-    const body: JsonObject = surface === "entities" ? { name: part, isLocation: true, parentId } : { name: part, parentId };
+    const body: JsonObject = { name: part, isLocation: true };
+    if (parentId) body.parentId = parentId;
     const created = toRecord(await client.createLocation(token, body));
     if (!created) throw new HomeboxMcpError("homebox", `Homebox did not return a location object after creating '${part}'`);
     const id = readId(created);
@@ -467,7 +467,7 @@ function isPrimaryAttachment(attachment: JsonObject): boolean {
 
 function sameParent(location: JsonObject, parentId?: string): boolean {
   if (!parentId) return true;
-  return readString(location.parentId) === parentId || readString(location.locationId) === parentId || readString(toRecord(location.parent)?.id) === parentId;
+  return readString(location.parentId) === parentId || readString(toRecord(location.parent)?.id) === parentId;
 }
 
 function splitLocationPath(value: string): string[] {
