@@ -352,13 +352,13 @@ describe("Homebox client", () => {
           parentId: "parent-1",
           tagIds: ["tag-1"],
         });
-        const body = req.body as { fields: Array<{ name: string; textValue?: string }>; parent?: unknown; tags?: unknown; entityType?: unknown };
+        const body = req.body as { fields: Array<{ type: string; name: string; textValue?: string }>; parent?: unknown; tags?: unknown; entityType?: unknown };
         expect(body.parent).toBeUndefined();
         expect(body.tags).toBeUndefined();
         expect(body.entityType).toBeUndefined();
         expect(body.fields).toEqual([
-          { name: "Keep", textValue: "old" },
-          { name: "Replace", textValue: "new" },
+          { type: "text", name: "Keep", textValue: "old" },
+          { type: "text", name: "Replace", textValue: "new" },
         ]);
         json(res, 200, req.body);
         return;

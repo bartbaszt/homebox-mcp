@@ -344,11 +344,11 @@ export class HomeboxClient {
   }
 
   async putEntity(token: string, entityId: string, body: JsonObject): Promise<unknown> {
-    return this.request("PUT", `/api/v1/entities/${encodeURIComponent(entityId)}`, { token, body });
+    return this.request("PUT", `/api/v1/entities/${encodeURIComponent(entityId)}`, { token, body: normalizeEntityPayload(body) });
   }
 
   async patchEntity(token: string, entityId: string, body: JsonObject): Promise<unknown> {
-    return this.request("PATCH", `/api/v1/entities/${encodeURIComponent(entityId)}`, { token, body });
+    return this.request("PATCH", `/api/v1/entities/${encodeURIComponent(entityId)}`, { token, body: normalizeEntityPatch(body) });
   }
 
   async deleteEntity(token: string, entityId: string): Promise<unknown> {
@@ -823,13 +823,25 @@ export function mergeEntityForPut(current: JsonObject, patch: JsonObject): JsonO
   for (const [key, value] of Object.entries(patch)) {
     if (key === "fields" && Array.isArray(value)) {
       merged.fields = mergeFields(Array.isArray(merged.fields) ? merged.fields : [], value as unknown[]);
-    } else if (key !== "tags") {
+    } else if (key === "purchaseTime") {
+      merged.purchaseDate = value;
+    } else if (key === "syncChildItemsLocations") {
+      merged.syncChildEntityLocations = value;
+    } else if (key !== "tags" && key !== "location" && key !== "locationId") {
       merged[key] = value;
     }
   }
 
+  if (merged.purchaseDate === undefined && patch.purchaseTime === undefined && current.purchaseDate !== undefined) {
+    merged.purchaseDate = current.purchaseDate;
+  }
+
   const parent = current.parent as JsonObject | undefined;
-  if (merged.parentId === undefined && typeof parent?.id === "string") merged.parentId = parent.id;
+  if (merged.parentId === undefined) {
+    if (typeof patch.parentId === "string") merged.parentId = patch.parentId;
+    else if (patch.locationId !== undefined) merged.parentId = patch.locationId;
+    else if (typeof parent?.id === "string") merged.parentId = parent.id;
+  }
 
   if (merged.tagIds === undefined && Array.isArray(current.tags)) {
     const tagIds = current.tags.map((tag) => (tag as JsonObject).id).filter((id): id is string => typeof id === "string");
@@ -839,7 +851,53 @@ export function mergeEntityForPut(current: JsonObject, patch: JsonObject): JsonO
   delete merged.parent;
   delete merged.entityType;
   delete merged.tags;
+  delete merged.location;
   return merged;
+}
+
+export function normalizeEntityPayload(body: JsonObject): JsonObject {
+  const out: JsonObject = {};
+  for (const [key, value] of Object.entries(body)) {
+    if (key === "purchaseTime") {
+      if (out.purchaseDate === undefined) out.purchaseDate = value;
+    } else if (key === "locationId") {
+      if (out.parentId === undefined) out.parentId = value;
+    } else if (key === "syncChildItemsLocations") {
+      if (out.syncChildEntityLocations === undefined) out.syncChildEntityLocations = value;
+    } else if (key === "fields" && Array.isArray(value)) {
+      out.fields = (value as unknown[]).map(normalizeField).filter((f): f is JsonObject => Boolean(f));
+    } else if (key !== "location" && key !== "parent" && key !== "entityType" && key !== "tags") {
+      out[key] = value;
+    }
+  }
+  if (out.purchaseDate === undefined && body.purchaseTime === undefined && body.purchaseDate !== undefined) out.purchaseDate = body.purchaseDate;
+  return out;
+}
+
+function normalizeField(field: unknown): JsonObject | undefined {
+  if (!field || typeof field !== "object" || Array.isArray(field)) return undefined;
+  const f = field as JsonObject;
+  const out: JsonObject = { ...f };
+  if (typeof out.type !== "string") out.type = "text";
+  if (out.parent !== undefined) delete out.parent;
+  if (out.entityType !== undefined) delete out.entityType;
+  return out;
+}
+
+function normalizeEntityPatch(body: JsonObject): JsonObject {
+  const out: JsonObject = {};
+  for (const [key, value] of Object.entries(body)) {
+    if (key === "locationId") {
+      if (out.parentId === undefined) out.parentId = value;
+    } else if (key === "syncChildItemsLocations") {
+      if (out.syncChildEntityLocations === undefined) out.syncChildEntityLocations = value;
+    } else if (key === "purchaseTime" || key === "purchaseDate" || key === "purchaseFrom" || key === "purchasePrice" || key === "manufacturer" || key === "modelNumber" || key === "serialNumber" || key === "notes" || key === "fields") {
+      continue;
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
 }
 
 function mergeFields(existing: unknown[], incoming: unknown[]): unknown[] {
