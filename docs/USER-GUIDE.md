@@ -31,7 +31,7 @@ Use API field names in tool payloads.
 
 | Homebox UI | API field |
 |---|---|
-| Purchase date / Data zakupu | `purchaseTime` |
+| Purchase date / Data zakupu | `purchaseTime` (emitted as `purchaseDate`) |
 | Purchased from / Zakupiono od | `purchaseFrom` |
 | Purchase price / Cena zakupu | `purchasePrice` |
 | Manufacturer / Producent | `manufacturer` |
@@ -42,7 +42,9 @@ Use API field names in tool payloads.
 | Tags / Tagi | `tagIds` |
 | Primary photo / thumbnail | primary attachment or `imageId` |
 
-Use `purchaseTime` for purchase date. Do not use `purchaseDate`.
+Use `purchaseTime` (alias) or `purchaseDate` for the purchase date. Workflows emit `purchaseDate` because Homebox v0.26.2 ignores `purchaseTime` on POST/PUT/PATCH.
+
+`homebox_create_item_full` and `homebox_upsert_items_bulk` accept `customFields` as a simple `{ name: value }` object and translate it to Homebox `fields[]` with `type:"text"` and `textValue`. Non-string values are serialized as text because Homebox v0.26.2 returns 500 when `PUT /entities/{id}` receives `type:"number"` or `type:"boolean"` fields (POST create accepts them). Fields without `type` also return 500, so always include `type` when constructing `fields` manually.
 
 ## Safe Entity Updates
 

@@ -7,6 +7,7 @@
 // (at your option) any later version.
 
 import type { HomeboxClient, JsonObject, PublicUrlFile } from "./homebox-client.js";
+import { mergeEntityForPut } from "./homebox-client.js";
 import { HomeboxMcpError, toSafeError } from "./errors.js";
 
 type FieldValue = string | number | boolean | null | Array<string | number | boolean>;
@@ -65,6 +66,7 @@ export interface ItemWorkflowInput {
   warrantyExpires?: string;
   warrantyDetails?: string;
   purchaseTime?: string;
+  purchaseDate?: string;
   purchasePrice?: number;
   currency?: string;
   purchaseFrom?: string;
@@ -260,13 +262,35 @@ export async function createItemFull(client: HomeboxClient, token: string, input
   const prepared = await prepareItem(client, token, input);
   if (input.dryRun) return { ...prepared, dryRun: true };
 
-  const item = await client.createItem(token, prepared.payload);
+  const item = await createEntityWithExtras(client, token, prepared.payload);
   const itemId = readId(toRecord(item));
   const photo = itemId && input.photoUrl && input.photoIsPrimary !== false
     ? await uploadPrimaryPhoto(client, token, { itemId, imageUrl: input.photoUrl, fileName: input.photoFileName, contentType: input.photoContentType })
     : undefined;
 
   return { ...prepared, dryRun: false, itemId, item, photo };
+}
+
+async function createEntityWithExtras(client: HomeboxClient, token: string, payload: JsonObject): Promise<unknown> {
+  const { core, extra } = splitCreatePayload(payload);
+  const item = await client.createItem(token, core);
+  const itemId = readId(toRecord(item));
+  if (!itemId || Object.keys(extra).length === 0) return item;
+  const current = await client.getEntity(token, itemId);
+  const merged = mergeEntityForPut(current, extra);
+  return client.putEntity(token, itemId, merged);
+}
+
+function splitCreatePayload(payload: JsonObject): { core: JsonObject; extra: JsonObject } {
+  const coreKeys = new Set(["name", "description", "quantity", "parentId", "entityTypeId", "tagIds", "insured", "archived", "assetId", "syncChildEntityLocations"]);
+  const core: JsonObject = {};
+  const extra: JsonObject = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (coreKeys.has(key)) core[key] = value;
+    else extra[key] = value;
+  }
+  if (typeof payload.name === "string") core.name = payload.name;
+  return { core, extra };
 }
 
 export async function uploadPrimaryPhoto(client: HomeboxClient, token: string, input: PhotoUploadInput): Promise<PhotoUploadResult> {
@@ -330,7 +354,7 @@ export async function upsertItemsBulk(client: HomeboxClient, token: string, inpu
           : undefined;
         result.updated.push({ index, itemId: existing.itemId, matchedBy: existing.matchedBy, item: updated, photo });
       } else {
-        const item = await client.createItem(token, prepared.payload);
+        const item = await createEntityWithExtras(client, token, prepared.payload);
         const itemId = readId(toRecord(item));
         const photo = itemId && fullItem.photoUrl && fullItem.photoIsPrimary !== false
           ? await uploadPrimaryPhoto(client, token, { itemId, imageUrl: fullItem.photoUrl, fileName: fullItem.photoFileName, contentType: fullItem.photoContentType })
@@ -359,7 +383,7 @@ function buildItemPayload(input: ItemWorkflowInput, tagIds: string[]): JsonObjec
   setDefined(body, "lifetimeWarranty", input.lifetimeWarranty);
   setDefined(body, "warrantyExpires", input.warrantyExpires);
   setDefined(body, "warrantyDetails", input.warrantyDetails);
-  setDefined(body, "purchaseTime", input.purchaseTime);
+  setDefined(body, "purchaseDate", input.purchaseDate ?? input.purchaseTime);
   setDefined(body, "purchasePrice", input.purchasePrice);
   setDefined(body, "currency", input.currency);
   setDefined(body, "purchaseFrom", input.purchaseFrom);
@@ -413,7 +437,7 @@ function workflowFields(input: ItemWorkflowInput): JsonObject[] {
   ].filter((field): field is JsonObject => Boolean(field));
 
   for (const [name, value] of Object.entries(input.customFields ?? {})) {
-    const field = textField(name, valueToText(value));
+    const field = customField(name, value);
     if (field) fields.push(field);
   }
   return fields;
@@ -426,7 +450,13 @@ function mergeFields(existing: unknown[], incoming: JsonObject[]): unknown[] {
 
 function textField(name: string, value: unknown): JsonObject | undefined {
   const textValue = valueToText(value);
-  return textValue === undefined ? undefined : { name, textValue };
+  return textValue === undefined ? undefined : { type: "text", name, textValue };
+}
+
+function customField(name: string, value: FieldValue): JsonObject | undefined {
+  if (value === undefined || value === null) return undefined;
+  const text = valueToText(value);
+  return text ? { type: "text", name, textValue: text } : undefined;
 }
 
 function valueToText(value: unknown): string | undefined {

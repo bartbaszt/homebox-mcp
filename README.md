@@ -177,7 +177,7 @@ Homebox UI field mapping for item/entity tools:
 
 | Homebox UI | API field |
 |---|---|
-| Purchase date / Data zakupu | `purchaseTime` |
+| Purchase date / Data zakupu | `purchaseTime` (emitted as `purchaseDate`) |
 | Purchased from / Zakupiono od | `purchaseFrom` |
 | Purchase price / Cena zakupu | `purchasePrice` |
 | Manufacturer / Producent | `manufacturer` |
@@ -188,7 +188,7 @@ Homebox UI field mapping for item/entity tools:
 | Tags / Tagi | `tagIds` |
 | Primary photo / thumbnail | primary attachment / `imageId` |
 
-Use `purchaseTime` for purchase date. Do not use `purchaseDate`. Use `parentId` for the parent location.
+Use `purchaseTime` (alias) or `purchaseDate` for the purchase date. Workflows emit `purchaseDate` because Homebox v0.26.2 ignores `purchaseTime` on POST/PUT/PATCH. Use `parentId` for the parent location. `customFields` accepts a simple `{ name: value }` object; workflows emit Homebox `fields[]` with `type:"text"` (Homebox v0.26.2 PUT 500s on `type:"number"`/`type:"boolean"`).
 
 Recommended purchase/import workflow:
 

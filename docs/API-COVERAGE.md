@@ -78,9 +78,9 @@ Items and locations are unified as entities. Item tools (`homebox_list_items`, `
 - `homebox_patch_item`: `PATCH /api/v1/entities/{id}` (supports `entityTypeId`, `parentId`, `quantity`, `tagIds`).
 - `homebox_delete_item`: `DELETE /api/v1/entities/{id}`.
 
-`homebox_update_item` accepts a `patch` object. Supported v0.26 fields include `name`, `description`, `quantity`, `insured`, `archived`, `assetId`, `serialNumber`, `modelNumber`, `manufacturer`, `lifetimeWarranty`, `warrantyExpires`, `warrantyDetails`, `purchaseTime`, `purchaseFrom`, `purchasePrice`, `soldTime`, `soldTo`, `soldPrice`, `soldNotes`, `notes`, `parentId`, `entityTypeId`, `tagIds`, `fields`, `syncChildEntityLocations`.
+`homebox_update_item` accepts a `patch` object. Supported v0.26 fields include `name`, `description`, `quantity`, `insured`, `archived`, `assetId`, `serialNumber`, `modelNumber`, `manufacturer`, `lifetimeWarranty`, `warrantyExpires`, `warrantyDetails`, `purchaseTime` (emitted as `purchaseDate`), `purchaseFrom`, `purchasePrice`, `soldTime`, `soldTo`, `soldPrice`, `soldNotes`, `notes`, `parentId`, `entityTypeId`, `tagIds`, `fields`, `syncChildEntityLocations`.
 
-Use `purchaseTime` for purchase date. Do not use `purchaseDate`. Use `parentId` for parent location.
+Use `purchaseTime` (alias) or `purchaseDate` for the purchase date; workflows emit `purchaseDate` because Homebox v0.26.2 ignores `purchaseTime` on POST/PUT/PATCH. Custom fields must include `type` plus the matching value key (`textValue`/`numberValue`/`booleanValue`); without `type`, PUT returns 500. Workflows emit `type:"text"` and serialize non-string values as text. Use `parentId` for parent location.
 
 ## Entities
 

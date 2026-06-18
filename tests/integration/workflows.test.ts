@@ -63,7 +63,22 @@ describe("Homebox workflows", () => {
           name: "Drill",
           description: "Cordless",
           quantity: 2,
-          purchaseTime: "2026-05-17",
+          parentId: "loc-1",
+          tagIds: ["tag-1"],
+        });
+        const body = req.body as Record<string, unknown>;
+        expect(body.purchaseTime).toBeUndefined();
+        expect(body.purchaseDate).toBeUndefined();
+        expect(body.fields).toBeUndefined();
+        return json(res, 201, { id: "entity-1", name: "Drill" });
+      }
+      if (req.method === "GET" && req.path === "/api/v1/entities/entity-1") {
+        return json(res, 200, { id: "entity-1", name: "Drill", parent: { id: "loc-1", name: "Garage" }, tags: [{ id: "tag-1", name: "Tool" }], fields: [] });
+      }
+      if (req.method === "PUT" && req.path === "/api/v1/entities/entity-1") {
+        expect(req.body).toMatchObject({
+          name: "Drill",
+          purchaseDate: "2026-05-17",
           purchaseFrom: "AliExpress",
           manufacturer: "Acme",
           modelNumber: "D-42",
@@ -71,14 +86,14 @@ describe("Homebox workflows", () => {
           parentId: "loc-1",
           tagIds: ["tag-1"],
         });
-        expect(req.body).not.toHaveProperty("purchaseDate");
-        const body = req.body as { fields?: Array<{ name: string; textValue: string }> };
+        expect(req.body).not.toHaveProperty("purchaseTime");
+        const body = req.body as { fields?: Array<{ type: string; name: string; textValue: string }> };
         expect(body.fields).toEqual([
-          { name: "External Asset ID", textValue: "asset-1" },
-          { name: "Order ID", textValue: "order-1" },
-          { name: "Source URL", textValue: "https://example.com/order/1" },
+          { type: "text", name: "External Asset ID", textValue: "asset-1" },
+          { type: "text", name: "Order ID", textValue: "order-1" },
+          { type: "text", name: "Source URL", textValue: "https://example.com/order/1" },
         ]);
-        return json(res, 201, { id: "entity-1", name: "Drill" });
+        return json(res, 200, req.body);
       }
       json(res, 404, { error: `${req.method} ${req.path}` });
     });
