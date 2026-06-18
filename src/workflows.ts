@@ -7,6 +7,8 @@
 // (at your option) any later version.
 
 import { createHash } from "node:crypto";
+import { readFile as readFileFs, stat as statFs } from "node:fs/promises";
+import { extname, basename } from "node:path";
 
 import type { HomeboxClient, JsonObject, PublicUrlFile } from "./homebox-client.js";
 import { mergeEntityForPut } from "./homebox-client.js";
@@ -114,12 +116,13 @@ export interface PhotoUploadInput {
   fileName?: string;
   base64?: string;
   contentType?: string;
+  filePath?: string;
 }
 
 export interface PhotoUploadResult {
   itemId: string;
   primary: true;
-  source: "url" | "base64" | "existing";
+  source: "url" | "base64" | "file" | "existing";
   url?: string;
   fileName?: string;
   contentType?: string;
@@ -314,23 +317,42 @@ function splitCreatePayload(payload: JsonObject): { core: JsonObject; extra: Jso
   return { core, extra };
 }
 
+const MIME_BY_EXT: Record<string, string> = {
+  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+  ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+};
+
+async function resolveFileSource(input: PhotoUploadInput, client: HomeboxClient): Promise<{ source: "url" | "base64" | "file"; url?: string; fileName: string; contentType?: string; base64: string; contentLength?: number }> {
+  if (input.imageUrl) {
+    const file = await client.fetchPublicUrlFile(input.imageUrl, input.fileName, input.contentType);
+    return { source: "url", url: file.url, fileName: file.fileName, contentType: file.contentType, base64: file.base64, contentLength: file.contentLength };
+  }
+  if (input.filePath) {
+    const pathStat = await statFs(input.filePath);
+    if (!pathStat.isFile()) throw new HomeboxMcpError("validation", `filePath is not a regular file: ${input.filePath}`);
+    const buf = await readFileFs(input.filePath);
+    const fileName = input.fileName ?? basename(input.filePath);
+    const ext = extname(input.filePath).toLowerCase();
+    const contentType = input.contentType ?? MIME_BY_EXT[ext];
+    if (!contentType || !contentType.startsWith("image/")) throw new HomeboxMcpError("validation", `filePath has unrecognized image extension "${ext}". Pass contentType explicitly (image/jpeg, image/png, image/webp).`);
+    return { source: "file", fileName, contentType, base64: buf.toString("base64"), contentLength: buf.length };
+  }
+  if (input.base64 && input.fileName) {
+    return { source: "base64", fileName: input.fileName, contentType: input.contentType, base64: input.base64 };
+  }
+  throw new HomeboxMcpError("validation", "Provide imageUrl, filePath (local file), or base64 with fileName.");
+}
+
 export async function uploadPrimaryPhoto(client: HomeboxClient, token: string, input: PhotoUploadInput): Promise<PhotoUploadResult> {
   const warnings: string[] = [];
   const attachments = asRecords(await client.listAttachments(token, input.itemId));
   const photoCount = attachments.filter(isPhotoAttachment).length;
   if (photoCount >= 3) warnings.push(`item already has ${photoCount} photo attachments; consider homebox_cleanup_duplicate_photos or homebox_ensure_primary_photo to avoid duplicates`);
 
-  if (input.imageUrl) {
-    const file = await client.fetchPublicUrlFile(input.imageUrl, input.fileName, input.contentType);
-    assertImage(file);
-    const attachment = await client.uploadAttachment({ token, itemId: input.itemId, fileName: file.fileName, base64: file.base64, contentType: file.contentType, primary: true });
-    return { itemId: input.itemId, primary: true, source: "url", url: file.url, fileName: file.fileName, contentType: file.contentType, contentLength: file.contentLength, attachment, warnings };
-  }
-
-  if (!input.base64 || !input.fileName) throw new HomeboxMcpError("validation", "Provide imageUrl, or base64 with fileName. Local file paths are not supported.");
-  assertImage({ contentType: input.contentType, fileName: input.fileName } as PublicUrlFile);
-  const attachment = await client.uploadAttachment({ token, itemId: input.itemId, fileName: input.fileName, base64: input.base64, contentType: input.contentType, primary: true });
-  return { itemId: input.itemId, primary: true, source: "base64", fileName: input.fileName, contentType: input.contentType, attachment, warnings };
+  const resolved = await resolveFileSource(input, client);
+  assertImage(resolved);
+  const attachment = await client.uploadAttachment({ token, itemId: input.itemId, fileName: resolved.fileName, base64: resolved.base64, contentType: resolved.contentType, primary: true });
+  return { itemId: input.itemId, primary: true, source: resolved.source, url: resolved.url, fileName: resolved.fileName, contentType: resolved.contentType, contentLength: resolved.contentLength, attachment, warnings };
 }
 
 export async function replacePrimaryPhoto(client: HomeboxClient, token: string, input: ReplacePrimaryPhotoInput): Promise<ReplacePrimaryPhotoResult> {
@@ -357,17 +379,9 @@ export async function ensurePrimaryPhoto(client: HomeboxClient, token: string, i
   const attachments = asRecords(await client.listAttachments(token, input.itemId));
   const warnings: string[] = [];
 
-  let resolvedFile: { fileName: string; contentType?: string; base64: string; contentLength?: number; url?: string };
-  if (input.imageUrl) {
-    const file = await client.fetchPublicUrlFile(input.imageUrl, input.fileName, input.contentType);
-    assertImage(file);
-    resolvedFile = { fileName: file.fileName, contentType: file.contentType, base64: file.base64, contentLength: file.contentLength, url: file.url };
-  } else if (input.base64 && input.fileName) {
-    assertImage({ contentType: input.contentType, fileName: input.fileName } as PublicUrlFile);
-    resolvedFile = { fileName: input.fileName, contentType: input.contentType, base64: input.base64 };
-  } else {
-    throw new HomeboxMcpError("validation", "Provide imageUrl, or base64 with fileName. Local file paths are not supported.");
-  }
+  const resolved = await resolveFileSource(input, client);
+  assertImage({ contentType: resolved.contentType, fileName: resolved.fileName } as PublicUrlFile);
+  const resolvedFile = { fileName: resolved.fileName, contentType: resolved.contentType, base64: resolved.base64, contentLength: resolved.contentLength, url: resolved.url };
 
   const incomingHash = sha256Hex(resolvedFile.base64);
   let existingId: string | undefined;
@@ -413,7 +427,7 @@ export async function ensurePrimaryPhoto(client: HomeboxClient, token: string, i
   resultAttachment = attachment;
   primaryAttachmentId = readId(toRecord(attachment));
   if (input.cleanupDuplicates) await cleanupDuplicatePhotos(client, token, { itemId: input.itemId });
-  return { itemId: input.itemId, primary: true, source: input.imageUrl ? "url" : "base64", url: resolvedFile.url, fileName: resolvedFile.fileName, contentType: resolvedFile.contentType, contentLength: resolvedFile.contentLength, attachment: resultAttachment, warnings, reused: false, primaryAttachmentId };
+  return { itemId: input.itemId, primary: true, source: resolved.source, url: resolvedFile.url, fileName: resolvedFile.fileName, contentType: resolvedFile.contentType, contentLength: resolvedFile.contentLength, attachment: resultAttachment, warnings, reused: false, primaryAttachmentId };
 }
 
 export async function cleanupDuplicatePhotos(client: HomeboxClient, token: string, input: { itemId: string; keepPrimary?: boolean }): Promise<CleanupDuplicatePhotosResult> {
@@ -615,7 +629,7 @@ function externalFieldName(keyName: DedupeKey): string {
 
 const IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp", "image/tiff"]);
 
-function assertImage(file: PublicUrlFile): void {
+function assertImage(file: { contentType?: string; fileName?: string }): void {
   const ct = file.contentType?.toLowerCase().split(";")[0].trim();
   if (!ct) return;
   if (ct === "text/html" || ct === "application/xhtml+xml") {

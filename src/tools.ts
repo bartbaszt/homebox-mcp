@@ -196,7 +196,7 @@ const locationResolutionOutput = {
 const photoUploadOutput = {
   itemId: z.string(),
   primary: z.literal(true),
-  source: z.enum(["url", "base64", "existing"]),
+  source: z.enum(["url", "base64", "file", "existing"]),
   url: z.string().optional(),
   fileName: z.string().optional(),
   contentType: z.string().optional(),
@@ -1131,7 +1131,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_upload_primary_photo_from_file",
     {
       title: "Upload Primary Photo",
-      description: "Upload a new attachment and set it as the primary item photo from a direct image file URL or base64. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... URLs — those belong in sourceUrls/notes, not as photoUrl. Local file paths are not supported. Use full-size product photo, not an externally generated thumbnail, unless the user explicitly wants the small image. IMPORTANT: this tool ALWAYS adds a new attachment — it does NOT replace existing primary photos. Repeated calls produce duplicate photo attachments. For idempotent set-primary use homebox_ensure_primary_photo. For replace-then-cleanup use homebox_replace_primary_photo (default deletes previous primary).",
+      description: "Upload a new attachment and set it as the primary item photo from a direct image file URL, local file path, or base64. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. filePath reads a local file from the MCP server filesystem. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... URLs — those belong in sourceUrls/notes, not as photoUrl. Use full-size product photo, not an externally generated thumbnail, unless the user explicitly wants the small image. IMPORTANT: this tool ALWAYS adds a new attachment — it does NOT replace existing primary photos. Repeated calls produce duplicate photo attachments. For idempotent set-primary use homebox_ensure_primary_photo. For replace-then-cleanup use homebox_replace_primary_photo (default deletes previous primary).",
       inputSchema: {
         ...authInput,
         itemId,
@@ -1139,6 +1139,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
         photoUrl: imageUrl.describe("Alias for imageUrl. Must be a direct image file URL, not a product page."),
         fileName: z.string().min(1).optional(),
         base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
+        filePath: z.string().min(1).optional().describe("Local file path on the MCP server filesystem. Read, base64-encode, and upload. Use when imageUrl is unavailable and base64 is inconvenient. Must be a regular image file (jpeg/png/webp)."),
         contentType: z.string().min(1).optional(),
       },
       outputSchema: photoUploadOutput,
@@ -1146,7 +1147,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     },
     (args) =>
       toolResult(
-        () => uploadPrimaryPhoto(state.homebox, tokenFrom(args, state), { itemId: args.itemId, imageUrl: args.imageUrl ?? args.photoUrl, fileName: args.fileName, base64: args.base64, contentType: args.contentType }),
+        () => uploadPrimaryPhoto(state.homebox, tokenFrom(args, state), { itemId: args.itemId, imageUrl: args.imageUrl ?? args.photoUrl, fileName: args.fileName, base64: args.base64, filePath: args.filePath, contentType: args.contentType }),
         "Primary photo uploaded",
       ),
   );
@@ -1155,7 +1156,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_replace_primary_photo",
     {
       title: "Replace Primary Photo",
-      description: "Upload a new primary item photo and delete the previous primary attachment by default. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... — store product page URLs in sourceUrls/notes instead. deletePreviousPrimary defaults to true (safer for agents); set to false to keep old primary as a regular attachment. For idempotent dedupe-by-URL/title/hash prefer homebox_ensure_primary_photo. Use a full-size product image, not a generated thumbnail, unless explicitly requested.",
+      description: "Upload a new primary item photo and delete the previous primary attachment by default. Accepts a direct image file URL, local filePath, or base64. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... — store product page URLs in sourceUrls/notes instead. deletePreviousPrimary defaults to true (safer for agents); set to false to keep old primary as a regular attachment. For idempotent dedupe-by-URL/title/hash prefer homebox_ensure_primary_photo. Use a full-size product image, not a generated thumbnail, unless explicitly requested.",
       inputSchema: {
         ...authInput,
         itemId,
@@ -1163,6 +1164,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
         photoUrl: imageUrl.describe("Alias for imageUrl. Must be a direct image file URL, not a product page."),
         fileName: z.string().min(1).optional(),
         base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
+        filePath: z.string().min(1).optional().describe("Local file path on the MCP server filesystem. Read, base64-encode, and upload. Must be a regular image file (jpeg/png/webp)."),
         contentType: z.string().min(1).optional(),
         deletePreviousPrimary: z.boolean().optional().default(true),
       },
@@ -1171,7 +1173,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     },
     (args) =>
       toolResult(
-        () => replacePrimaryPhoto(state.homebox, tokenFrom(args, state), { itemId: args.itemId, imageUrl: args.imageUrl ?? args.photoUrl, fileName: args.fileName, base64: args.base64, contentType: args.contentType, deletePreviousPrimary: args.deletePreviousPrimary }),
+        () => replacePrimaryPhoto(state.homebox, tokenFrom(args, state), { itemId: args.itemId, imageUrl: args.imageUrl ?? args.photoUrl, fileName: args.fileName, base64: args.base64, filePath: args.filePath, contentType: args.contentType, deletePreviousPrimary: args.deletePreviousPrimary }),
         "Primary photo replaced",
       ),
   );
@@ -1180,7 +1182,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_ensure_primary_photo",
     {
       title: "Ensure Primary Photo",
-      description: "Idempotent primary photo setter. Fetches existing attachments first and reuses an existing photo attachment when one matches by title (fileName) or content hash — only updates its primary flag. When no match exists, uploads the new photo and sets it primary. Avoids duplicate attachments from repeated agent calls. Pass cleanupDuplicates=true to also remove other duplicate photo attachments after setting primary. imageUrl/photoUrl must be a direct image file URL (image/jpeg, image/png or image/webp), not a product page. Local file paths are not supported.",
+      description: "Idempotent primary photo setter. Fetches existing attachments first and reuses an existing photo attachment when one matches by title (fileName) or content hash — only updates its primary flag. When no match exists, uploads the new photo (from imageUrl, local filePath, or base64) and sets it primary. Avoids duplicate attachments from repeated agent calls. Pass cleanupDuplicates=true to also remove other duplicate photo attachments after setting primary. imageUrl/photoUrl must be a direct image file URL (image/jpeg, image/png or image/webp), not a product page.",
       inputSchema: {
         ...authInput,
         itemId,
@@ -1188,6 +1190,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
         photoUrl: imageUrl.describe("Alias for imageUrl. Must be a direct image file URL, not a product page."),
         fileName: z.string().min(1).optional(),
         base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
+        filePath: z.string().min(1).optional().describe("Local file path on the MCP server filesystem. Read, base64-encode, and upload. Must be a regular image file (jpeg/png/webp)."),
         contentType: z.string().min(1).optional(),
         dedupe: z.boolean().optional().default(true).describe("When true (default), reuse existing attachment by title or content hash instead of uploading again."),
         cleanupDuplicates: z.boolean().optional().default(false).describe("When true, also run homebox_cleanup_duplicate_photos after setting primary."),
@@ -1197,7 +1200,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     },
     (args) =>
       toolResult(
-        () => ensurePrimaryPhoto(state.homebox, tokenFrom(args, state), { itemId: args.itemId, imageUrl: args.imageUrl ?? args.photoUrl, fileName: args.fileName, base64: args.base64, contentType: args.contentType, dedupe: args.dedupe, cleanupDuplicates: args.cleanupDuplicates }),
+        () => ensurePrimaryPhoto(state.homebox, tokenFrom(args, state), { itemId: args.itemId, imageUrl: args.imageUrl ?? args.photoUrl, fileName: args.fileName, base64: args.base64, filePath: args.filePath, contentType: args.contentType, dedupe: args.dedupe, cleanupDuplicates: args.cleanupDuplicates }),
         "Primary photo ensured",
       ),
   );

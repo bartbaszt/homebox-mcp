@@ -175,7 +175,7 @@ Use `homebox_resolve_tags` with `labels` or `names`. It dedupes names, prefers e
 
 ## Photos And Attachments
 
-Workflow photo tools prefer public `imageUrl` or `photoUrl` values. Local file paths such as `/mnt/data/...` are not supported. Direct `base64` with `fileName` is the fallback.
+Workflow photo tools prefer public `imageUrl` or `photoUrl` values. Local file paths are supported via the `filePath` parameter — MCP reads the file from the server filesystem, base64-encodes it, and uploads. Direct `base64` with `fileName` is the fallback when neither URL nor local file is available.
 
 Use full-size product images for primary photos. Do not upload externally generated thumbnails as primary photos unless the user explicitly wants the small image.
 
