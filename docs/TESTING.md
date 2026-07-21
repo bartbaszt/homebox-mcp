@@ -22,7 +22,7 @@ Coverage:
 - Full entity update via GET-merge-PUT preserving custom fields and tags, converting `parent` to `parentId`.
 - `setPrimaryAttachment` routes to `PUT /entities/{id}/attachments/{att}` with `{primary:true}`.
 - Workflow helpers for tag resolution, location creation, full entity creation, bulk upsert, primary photo replacement and public URL validation.
-- Workflow payload mapping uses `purchaseTime` for purchase date and rejects `purchaseDate` in generated payloads.
+- Workflow payload mapping accepts `purchaseTime` as an alias and emits Homebox `purchaseDate`; direct `purchaseDate` is also accepted.
 - MCP endpoint API-token enforcement.
 - Fail-closed startup for non-local listeners without MCP auth and rejection of placeholder API tokens.
 - ChatGPT-style OAuth DCR + PKCE connection flow.
@@ -31,6 +31,12 @@ Coverage:
 - OAuth client/token persistence across server restarts when `HOMEBOX_MCP_DATA_DIR` is configured.
 - Atomic refresh token consumption to prevent refresh token replay.
 - Tool calls through Streamable HTTP client.
+- Tool-contract discovery checks for strict v0.26 create/patch schemas and destructive annotations.
+- Runtime rejection of unsupported create fields, unsupported PATCH fields and empty PATCH mutations before any Homebox request.
+- Safe filesystem/internal error mapping without absolute-path or arbitrary error-message leakage.
+- Local photo root containment, size bounds, and JPEG/PNG/WebP magic-byte validation for file/base64 sources.
+- SSRF rejection for private redirects, IPv4-mapped/NAT64/6to4/reserved IPv6 ranges, and canonical generic API paths.
+- OAuth body limits, client/token quotas, grant-unique SSE principals, persisted legacy-principal migration, and startup/listen failures.
 
 ## Real E2E
 
@@ -55,9 +61,4 @@ The default E2E is read-only:
 - Verifies generic `homebox_api_request`.
 - Verifies bad session handling.
 
-Destructive E2E is intentionally off by default. Enable only on disposable instances:
-
-```powershell
-$env:HOMEBOX_E2E_DESTRUCTIVE = "1"
-npm run test:e2e
-```
+No destructive E2E suite is currently shipped. `HOMEBOX_E2E_DESTRUCTIVE` remains reserved for a future disposable-instance suite with mandatory cleanup.

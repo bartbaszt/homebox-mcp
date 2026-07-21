@@ -79,7 +79,7 @@ const purchaseImportWorkflow = [
   "1. Resolve location by name (locations are entities with isLocation=true).",
   "2. Resolve or create tags.",
   "3. Create entity with stable fields: name, description, quantity, parentId, tagIds.",
-  "4. Patch purchasePrice, purchaseTime, purchaseFrom, manufacturer, modelNumber, notes.",
+  "4. Update purchasePrice, purchaseTime, purchaseFrom, manufacturer, modelNumber and notes with homebox_update_item (GET-merge-PUT), never PATCH.",
   "5. Upload primary photo.",
   "6. Verify with homebox_get_entity.",
 ].join("\n");
@@ -87,7 +87,7 @@ const purchaseImportWorkflow = [
 const itemPayloadFields = {
   name: z.string().min(1).optional().describe("Item name."),
   description: z.string().min(1).optional(),
-  quantity: z.number().positive().optional(),
+  quantity: z.number().nonnegative().optional(),
   insured: z.boolean().optional(),
   archived: z.boolean().optional(),
   assetId: z.string().min(1).optional().describe("Homebox asset ID. May be auto-generated; do not store external order IDs here unless intended."),
@@ -113,8 +113,30 @@ const itemPayloadFields = {
   syncChildItemsLocations: z.boolean().optional(),
   syncChildEntityLocations: z.boolean().optional(),
 };
-const itemCreateBody = z.object({ ...itemPayloadFields, name: z.string().min(1).describe("Item name.") }).passthrough();
-const itemPatchBody = z.object(itemPayloadFields).passthrough();
+const itemCreateBody = z.object({
+  name: z.string().min(1).describe("Item name."),
+  description: z.string().min(1).optional(),
+  quantity: z.number().nonnegative().optional(),
+  parentId: z.string().min(1).optional().describe("Parent entity ID (location)."),
+  locationId: z.string().min(1).optional().describe("Alias for parentId; normalized before the Homebox request."),
+  entityTypeId: entityTypeId.optional(),
+  tagIds: z.array(z.string().min(1)).optional(),
+  insured: z.boolean().optional(),
+  archived: z.boolean().optional(),
+  assetId: z.string().min(1).optional().describe("Homebox asset ID. May be auto-generated; do not store external order IDs here unless intended."),
+  syncChildEntityLocations: z.boolean().optional(),
+  syncChildItemsLocations: z.boolean().optional().describe("Alias for syncChildEntityLocations; normalized before the Homebox request."),
+}).strict();
+const itemUpdateBody = z.object(itemPayloadFields).passthrough();
+const directEntityPatchBody = z.object({
+  entityTypeId: entityTypeId.optional(),
+  parentId: z.string().min(1).optional().describe("Parent entity ID (location)."),
+  locationId: z.string().min(1).optional().describe("Alias for parentId; normalized before the Homebox request."),
+  quantity: z.number().nonnegative().optional(),
+  tagIds: z.array(z.string().min(1)).optional(),
+}).strict().refine((patch) => Object.keys(patch).length > 0, {
+  message: "Provide at least one mutation: entityTypeId, parentId/locationId, quantity or tagIds.",
+});
 
 const arrayDataOutput = { data: z.array(z.unknown()) };
 const publicSessionOutput = {
@@ -135,11 +157,12 @@ const downloadedFileOutput = {
 };
 const downloadedAttachmentOutput = { ...downloadedFileOutput, itemId: z.string(), attachmentId: z.string() };
 const downloadedEntityAttachmentOutput = { ...downloadedFileOutput, entityId: z.string(), attachmentId: z.string() };
+const downloadedGroupExportOutput = { ...downloadedFileOutput, exportId: z.string() };
 const workflowFieldValue = z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(z.union([z.string(), z.number(), z.boolean()]))]);
 const itemWorkflowInput = {
   name: z.string().min(1),
   description: z.string().min(1).optional(),
-  quantity: z.number().positive().optional(),
+  quantity: z.number().nonnegative().optional(),
   insured: z.boolean().optional(),
   archived: z.boolean().optional(),
   assetId: z.string().min(1).optional().describe("Homebox asset ID. Prefer custom fields for external order IDs unless overwriting assetId is intended."),
@@ -390,29 +413,30 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     {
       title: "Create Homebox Item",
       description: [
-        "Low-level create via POST /api/v1/entities.",
-        "Required: body Homebox entity create payload. For natural-language purchase/import workflows, prefer homebox_create_item_full or homebox_upsert_items_bulk.",
-        itemUiApiMapping,
+        "Low-level strict create via POST /api/v1/entities.",
+        "body accepts only Homebox v0.26 POST core fields: name, description, quantity, parentId/locationId, entityTypeId, tagIds, insured, archived, assetId and syncChildEntityLocations/syncChildItemsLocations.",
+        "Purchase, manufacturer, model, serial, notes and custom-field values are not accepted here. Use homebox_create_item_full, which creates core fields then applies detail fields through safe GET-merge-PUT.",
         v026Notes,
       ].join("\n\n"),
-      inputSchema: { ...authInput, body: itemCreateBody.describe("Homebox entity create payload. Unknown Homebox fields are passed through.") },
+      inputSchema: z.object({ ...authInput, body: itemCreateBody.describe("Strict Homebox v0.26 entity create payload.") }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.createItem(tokenFrom(args, state), args.body as JsonObject), "Entity created"),
   );
 
-    server.registerTool(
+  server.registerTool(
     "homebox_update_item",
     {
       title: "Update Homebox Item Safely",
       description: [
         "Update an entity by reading current entity, merging patch, and PUT-ing full payload. Preserves fields/tags and converts parent to parentId.",
         "Required: itemId Homebox entity UUID; patch partial entity fields to update.",
+        "Homebox v0.26 purchase, manufacturer, model, serial, notes and custom-field updates require this GET-merge-PUT path; never send them through PATCH.",
         entityPatchFields,
         itemUiApiMapping,
         v026Notes,
       ].join("\n\n"),
-      inputSchema: { ...authInput, itemId, patch: itemPatchBody.describe("Partial entity fields to merge into current entity. Use purchaseTime, not purchaseDate. Use parentId for location.") },
+      inputSchema: { ...authInput, itemId, patch: itemUpdateBody.describe("Partial entity fields to merge into current entity. Use purchaseTime, not purchaseDate. Use parentId for location.") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.updateItem(tokenFrom(args, state), args.itemId, args.patch as JsonObject), "Entity updated"),
@@ -437,8 +461,8 @@ export function registerHomeboxTools(server: McpServer, state: ToolState): void 
     "homebox_patch_item",
     {
       title: "Patch Homebox Item",
-      description: "Direct PATCH /api/v1/entities/{id}. Supports entityTypeId, parentId, quantity and tagIds. For broader updates prefer homebox_update_item which GET-merges and PUTs a safe full payload.",
-      inputSchema: { ...authInput, itemId, patch: jsonObject },
+      description: "Direct strict PATCH /api/v1/entities/{id}. Requires at least one of entityTypeId, parentId/locationId, quantity or tagIds; no other fields are accepted. Purchase, manufacturer, model, serial, notes and custom-field updates require homebox_update_item GET-merge-PUT and must never use PATCH.",
+      inputSchema: z.object({ ...authInput, itemId, patch: directEntityPatchBody }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.patchItem(tokenFrom(args, state), args.itemId, args.patch as JsonObject), "Entity patched"),
@@ -704,8 +728,8 @@ function registerEntityTools(server: McpServer, state: ToolState): void {
     "homebox_patch_entity",
     {
       title: "Patch Entity",
-      description: "PATCH /api/v1/entities/{id}. Supports entityTypeId, parentId, quantity and tagIds. For broader updates prefer homebox_update_item which GET-merges and PUTs a safe full payload.",
-      inputSchema: { ...authInput, entityId, patch: jsonObject.describe("Entity patch payload.") },
+      description: "Direct strict PATCH /api/v1/entities/{id}. Requires at least one of entityTypeId, parentId/locationId, quantity or tagIds; no other fields are accepted. Purchase, manufacturer, model, serial, notes and custom-field updates require homebox_update_item GET-merge-PUT and must never use PATCH.",
+      inputSchema: z.object({ ...authInput, entityId, patch: directEntityPatchBody.describe("Strict Homebox v0.26 entity patch payload.") }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.patchEntity(tokenFrom(args, state), args.entityId, args.patch as JsonObject), "Entity patched"),
@@ -1053,7 +1077,7 @@ function registerAttachmentTools(server: McpServer, state: ToolState): void {
 }
 
 function registerWorkflowTools(server: McpServer, state: ToolState): void {
-  const imageUrl = z.string().url().optional().describe("Direct image file URL only. Must return image/jpeg, image/png or image/webp. Do NOT pass product page URLs (Amazon /dp/..., AliExpress /item/...) — store those in sourceUrls/notes instead. Local file paths are not supported.");
+  const imageUrl = z.string().url().optional().describe("Direct image file URL only. Must return image/jpeg, image/png or image/webp. Do NOT pass product page URLs (Amazon /dp/..., AliExpress /item/...) — store those in sourceUrls/notes instead. This URL field does not accept local paths; use opt-in filePath when HOMEBOX_MCP_LOCAL_FILE_ROOT is configured.");
 
   server.registerTool(
     "homebox_resolve_tags",
@@ -1131,7 +1155,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_upload_primary_photo_from_file",
     {
       title: "Upload Primary Photo",
-      description: "Upload a new attachment and set it as the primary item photo from a direct image file URL, local file path, or base64. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. filePath reads a local file from the MCP server filesystem. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... URLs — those belong in sourceUrls/notes, not as photoUrl. Use full-size product photo, not an externally generated thumbnail, unless the user explicitly wants the small image. IMPORTANT: this tool ALWAYS adds a new attachment — it does NOT replace existing primary photos. Repeated calls produce duplicate photo attachments. For idempotent set-primary use homebox_ensure_primary_photo. For replace-then-cleanup use homebox_replace_primary_photo (default deletes previous primary).",
+      description: "Upload a new attachment and set it as the primary item photo from a direct image file URL, opt-in local file path, or base64. filePath is disabled unless HOMEBOX_MCP_LOCAL_FILE_ROOT is configured and is confined beneath that root. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... URLs — those belong in sourceUrls/notes, not as photoUrl. Use full-size product photo, not an externally generated thumbnail, unless the user explicitly wants the small image. IMPORTANT: this tool ALWAYS adds a new attachment — it does NOT replace existing primary photos. Repeated calls produce duplicate photo attachments. For idempotent set-primary use homebox_ensure_primary_photo. For replace-then-cleanup use homebox_replace_primary_photo (default deletes previous primary).",
       inputSchema: {
         ...authInput,
         itemId,
@@ -1139,7 +1163,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
         photoUrl: imageUrl.describe("Alias for imageUrl. Must be a direct image file URL, not a product page."),
         fileName: z.string().min(1).optional(),
         base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
-        filePath: z.string().min(1).optional().describe("Local file path on the MCP server filesystem. Read, base64-encode, and upload. Use when imageUrl is unavailable and base64 is inconvenient. Must be a regular image file (jpeg/png/webp)."),
+        filePath: z.string().min(1).optional().describe("Opt-in server-local image path. Disabled unless HOMEBOX_MCP_LOCAL_FILE_ROOT is configured; resolved path must remain beneath that root."),
         contentType: z.string().min(1).optional(),
       },
       outputSchema: photoUploadOutput,
@@ -1156,7 +1180,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_replace_primary_photo",
     {
       title: "Replace Primary Photo",
-      description: "Upload a new primary item photo and delete the previous primary attachment by default. Accepts a direct image file URL, local filePath, or base64. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... — store product page URLs in sourceUrls/notes instead. deletePreviousPrimary defaults to true (safer for agents); set to false to keep old primary as a regular attachment. For idempotent dedupe-by-URL/title/hash prefer homebox_ensure_primary_photo. Use a full-size product image, not a generated thumbnail, unless explicitly requested.",
+      description: "Upload a new primary item photo and delete the previous primary attachment by default. Accepts a direct image file URL, opt-in local filePath, or base64. filePath is disabled unless HOMEBOX_MCP_LOCAL_FILE_ROOT is configured and is confined beneath that root. imageUrl/photoUrl must point directly to an image file and return image/jpeg, image/png or image/webp. Do NOT pass HTML product pages such as Amazon /dp/... or AliExpress /item/... — store product page URLs in sourceUrls/notes instead. deletePreviousPrimary defaults to true (safer for agents); set to false to keep old primary as a regular attachment. For idempotent dedupe-by-URL/title/hash prefer homebox_ensure_primary_photo. Use a full-size product image, not a generated thumbnail, unless explicitly requested.",
       inputSchema: {
         ...authInput,
         itemId,
@@ -1164,7 +1188,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
         photoUrl: imageUrl.describe("Alias for imageUrl. Must be a direct image file URL, not a product page."),
         fileName: z.string().min(1).optional(),
         base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
-        filePath: z.string().min(1).optional().describe("Local file path on the MCP server filesystem. Read, base64-encode, and upload. Must be a regular image file (jpeg/png/webp)."),
+        filePath: z.string().min(1).optional().describe("Opt-in server-local image path. Disabled unless HOMEBOX_MCP_LOCAL_FILE_ROOT is configured; resolved path must remain beneath that root."),
         contentType: z.string().min(1).optional(),
         deletePreviousPrimary: z.boolean().optional().default(true),
       },
@@ -1182,7 +1206,7 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_ensure_primary_photo",
     {
       title: "Ensure Primary Photo",
-      description: "Idempotent primary photo setter. Fetches existing attachments first and reuses an existing photo attachment when one matches by title (fileName) or content hash — only updates its primary flag. When no match exists, uploads the new photo (from imageUrl, local filePath, or base64) and sets it primary. Avoids duplicate attachments from repeated agent calls. Pass cleanupDuplicates=true to also remove other duplicate photo attachments after setting primary. imageUrl/photoUrl must be a direct image file URL (image/jpeg, image/png or image/webp), not a product page.",
+      description: "Idempotent primary photo setter. Fetches existing attachments first and reuses a photo matching by title (fileName) or content hash; otherwise uploads one from imageUrl, opt-in local filePath, or base64. filePath is disabled unless HOMEBOX_MCP_LOCAL_FILE_ROOT is configured and is confined beneath that root. WARNING: cleanupDuplicates=true deletes other duplicate photo attachments after setting primary, so this tool is marked destructive. imageUrl/photoUrl must be a direct image file URL (image/jpeg, image/png or image/webp), not a product page.",
       inputSchema: {
         ...authInput,
         itemId,
@@ -1190,13 +1214,13 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
         photoUrl: imageUrl.describe("Alias for imageUrl. Must be a direct image file URL, not a product page."),
         fileName: z.string().min(1).optional(),
         base64: z.string().min(1).optional().describe("Direct base64 fallback. Do not pass local file paths."),
-        filePath: z.string().min(1).optional().describe("Local file path on the MCP server filesystem. Read, base64-encode, and upload. Must be a regular image file (jpeg/png/webp)."),
+        filePath: z.string().min(1).optional().describe("Opt-in server-local image path. Disabled unless HOMEBOX_MCP_LOCAL_FILE_ROOT is configured; resolved path must remain beneath that root."),
         contentType: z.string().min(1).optional(),
         dedupe: z.boolean().optional().default(true).describe("When true (default), reuse existing attachment by title or content hash instead of uploading again."),
         cleanupDuplicates: z.boolean().optional().default(false).describe("When true, also run homebox_cleanup_duplicate_photos after setting primary."),
       },
       outputSchema: ensurePrimaryPhotoOutput,
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) =>
       toolResult(
@@ -1209,11 +1233,11 @@ function registerWorkflowTools(server: McpServer, state: ToolState): void {
     "homebox_cleanup_duplicate_photos",
     {
       title: "Cleanup Duplicate Photos",
-      description: "Remove duplicate photo attachments for an entity. Groups photos by title+mimeType and keeps one per group (preferring the current primary). Useful after repeated homebox_upload_primary_photo_from_file calls. keepPrimary defaults to true; set to false to remove all but the primary across all duplicate groups.",
+      description: "Remove duplicate photo attachments for an entity. Groups photos by title+mimeType and always keeps one attachment per duplicate group. keepPrimary=true (default) prefers the current primary as that group's keeper; false only disables that preference and still keeps one. Useful after repeated homebox_upload_primary_photo_from_file calls.",
       inputSchema: {
         ...authInput,
         itemId,
-        keepPrimary: z.boolean().optional().default(true).describe("Keep the current primary attachment even if its group has duplicates."),
+        keepPrimary: z.boolean().optional().default(true).describe("Prefer the current primary as duplicate-group keeper. false still keeps one attachment per group; it only disables primary preference."),
       },
       outputSchema: cleanupDuplicatePhotosOutput,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
@@ -1305,7 +1329,7 @@ function registerLocationAndFieldTools(server: McpServer, state: ToolState): voi
     "homebox_update_location",
     {
       title: "Update Location",
-      description: "Update a Homebox location.",
+      description: "Safely update a Homebox location using GET-merge-PUT so parent, tags and custom fields are preserved.",
       inputSchema: { ...authInput, locationId, body: jsonObject },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -1606,7 +1630,7 @@ function registerGroupTools(server: McpServer, state: ToolState): void {
       title: "Download Group Export Artifact",
       description: "Download a collection export ZIP artifact via GET /api/v1/group/exports/{id}/download. Returns base64 within configured size limit.",
       inputSchema: { ...authInput, exportId: z.string().min(1).describe("Homebox group export job ID.") },
-      outputSchema: downloadedFileOutput,
+      outputSchema: downloadedGroupExportOutput,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     (args) => toolResult(() => state.homebox.downloadGroupExportArtifact(tokenFrom(args, state), args.exportId), "Group export artifact downloaded"),
@@ -1866,7 +1890,7 @@ function registerGenericRequestTool(server: McpServer, state: ToolState): void {
     "homebox_api_request",
     {
       title: "Homebox API Request",
-      description: "Low-level escape hatch. Prefer typed tools. Use only when a typed tool does not expose the required endpoint or field. Caller is responsible for full Homebox payload compatibility. Only relative /api/v1/... paths on the configured Homebox instance are allowed; absolute URLs are rejected.",
+      description: "Low-level escape hatch supporting GET, POST, PUT, PATCH and DELETE. It can mutate or delete Homebox data and is marked destructive. Prefer typed tools. Use only when a typed tool does not expose the required endpoint or field. Caller is responsible for full Homebox payload compatibility. Only relative /api/v1/... paths on the configured Homebox instance are allowed; absolute URLs are rejected.",
       inputSchema: {
         ...authInput,
         method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).default("GET"),
@@ -1874,7 +1898,7 @@ function registerGenericRequestTool(server: McpServer, state: ToolState): void {
         query: z.record(z.string(), queryValue).optional(),
         body: z.unknown().optional(),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     (args) =>
       toolResult(

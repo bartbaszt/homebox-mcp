@@ -32,8 +32,18 @@ export interface PublicSessionInfo {
 export class SessionStore {
   private readonly sessions = new Map<string, HomeboxSession>();
 
+  constructor(private readonly maxSessions = 1_000) {
+    if (!Number.isInteger(maxSessions) || maxSessions <= 0) {
+      throw new HomeboxMcpError("config", "Session capacity must be a positive integer");
+    }
+  }
+
   set(session: Omit<HomeboxSession, "sessionKey" | "createdAt"> & { sessionKey?: string; createdAt?: string }): PublicSessionInfo {
+    this.evictExpired();
     const sessionKey = session.sessionKey?.trim() || randomUUID();
+    if (!this.sessions.has(sessionKey) && this.sessions.size >= this.maxSessions) {
+      throw new HomeboxMcpError("auth", `Session capacity (${this.maxSessions}) reached. Log out an existing session before calling homebox_login again.`);
+    }
     const createdAt = session.createdAt ?? new Date().toISOString();
     const stored: HomeboxSession = { ...session, sessionKey, createdAt };
     this.sessions.set(sessionKey, stored);
@@ -43,6 +53,10 @@ export class SessionStore {
   get(sessionKey: string): HomeboxSession {
     const session = this.sessions.get(sessionKey);
     if (!session) throw new HomeboxMcpError("auth", `Unknown sessionKey '${sessionKey}'. Call homebox_login first.`);
+    if (isExpired(session, Date.now())) {
+      this.sessions.delete(sessionKey);
+      throw new HomeboxMcpError("auth", "Session expired. Call homebox_login again.");
+    }
     return session;
   }
 
@@ -60,7 +74,14 @@ export class SessionStore {
   }
 
   list(): PublicSessionInfo[] {
+    this.evictExpired();
     return [...this.sessions.values()].map((session) => this.toPublic(session));
+  }
+
+  private evictExpired(now = Date.now()): void {
+    for (const [sessionKey, session] of this.sessions) {
+      if (isExpired(session, now)) this.sessions.delete(sessionKey);
+    }
   }
 
   private toPublic(session: HomeboxSession): PublicSessionInfo {
@@ -73,4 +94,10 @@ export class SessionStore {
       refreshedAt: session.refreshedAt,
     };
   }
+}
+
+function isExpired(session: HomeboxSession, now: number): boolean {
+  if (!session.expiresAt) return false;
+  const expiresAt = Date.parse(session.expiresAt);
+  return Number.isFinite(expiresAt) && expiresAt <= now;
 }

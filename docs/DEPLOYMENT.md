@@ -73,7 +73,7 @@ HOMEBOX_MCP_API_TOKEN=replace-with-a-long-random-token
 # HOMEBOX_MCP_OAUTH_ENABLED=true
 # HOMEBOX_MCP_PUBLIC_URL=https://mcp.example.com/mcp
 # HOMEBOX_MCP_OAUTH_ISSUER=https://mcp.example.com
-# HOMEBOX_MCP_TRUST_PROXY=true
+# HOMEBOX_MCP_TRUST_PROXY=127.0.0.1,::1
 # HOMEBOX_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=3600
 # HOMEBOX_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS=2592000
 # HOMEBOX_MCP_OAUTH_AUTH_CODE_TTL_SECONDS=300
@@ -81,6 +81,10 @@ HOMEBOX_MCP_API_TOKEN=replace-with-a-long-random-token
 
 # Persist OAuth client registrations/tokens across container restarts
 HOMEBOX_MCP_DATA_DIR=/data
+
+# Optional local photo uploads. Requires a separate read-only volume mounted at /photos.
+# Never point this at /data or any directory containing credentials.
+# HOMEBOX_MCP_LOCAL_FILE_ROOT=/photos
 
 HOMEBOX_API_TIMEOUT_MS=30000
 HOMEBOX_MCP_MAX_UPLOAD_BYTES=10485760
@@ -123,6 +127,17 @@ docker compose logs -f homebox-mcp
 
 This uses the `build:` directive in the shipped `docker-compose.yml` to build locally.
 
+To enable workflow `filePath` photo uploads, mount a dedicated directory read-only and set the opt-in root:
+
+```yaml
+environment:
+  HOMEBOX_MCP_LOCAL_FILE_ROOT: /photos
+volumes:
+  - /srv/homebox-photos:/photos:ro
+```
+
+Without this setting, `filePath` is rejected. The root must be an existing directory and must not contain `/data`, TLS keys, OAuth data, or other secrets.
+
 ## Changing the Host Port
 
 `HOMEBOX_MCP_PORT` is the internal container port. The `ports` mapping in `compose.yml` controls the host port.
@@ -146,7 +161,7 @@ The proxy must forward traffic to the container and preserve standard headers:
 - `X-Forwarded-Host`
 - `X-Forwarded-For`
 
-Set `HOMEBOX_MCP_TRUST_PROXY=true` so Express trusts these headers.
+Set `HOMEBOX_MCP_TRUST_PROXY` to the exact reverse-proxy addresses or CIDRs, comma-separated, so Express trusts forwarded headers only from those peers. Value `true` is retained as shorthand for loopback proxies only. Never trust all private networks on an externally reachable listener.
 
 ### Cloudflare Tunnel Example
 

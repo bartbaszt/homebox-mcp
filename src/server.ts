@@ -6,15 +6,16 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
+import { isIP } from "node:net";
 import { join } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import express, { type NextFunction, type Request, type Response } from "express";
+import express, { type NextFunction, type Request, type RequestHandler, type Response } from "express";
 
 import { type AppConfig, type OAuthConfig, loadConfig, loadTlsConfig, validateConfigSecurity } from "./config.js";
 import { HomeboxMcpError } from "./errors.js";
@@ -39,14 +40,37 @@ export interface StartedServer {
   close: () => Promise<void>;
 }
 
+interface SseSessionEntry {
+  server: McpServer;
+  transport: SSEServerTransport;
+  principal: string;
+  account: string;
+  lifetimeTimer?: NodeJS.Timeout;
+  closing?: Promise<void>;
+}
+
+const sseSessionsByRuntime = new WeakMap<RuntimeState, Map<string, SseSessionEntry>>();
+const MAX_SSE_SESSIONS = 256;
+const MAX_SSE_SESSIONS_PER_PRINCIPAL = 8;
+const MAX_SSE_SESSIONS_PER_ACCOUNT = 16;
+const SSE_SESSION_MAX_LIFETIME_MS = 60 * 60_000;
+
 export function createRuntime(config = loadConfig()): RuntimeState {
   const oauth = oauthConfig(config);
-  return {
+  const state: RuntimeState = {
     config,
-    homebox: new HomeboxClient(config.homeboxBaseUrl, config.timeoutMs, config.maxUploadBytes, config.maxDownloadBytes),
+    homebox: new HomeboxClient(
+      config.homeboxBaseUrl,
+      config.timeoutMs,
+      config.maxUploadBytes,
+      config.maxDownloadBytes,
+      config.localFileRoot,
+    ),
     sessions: new SessionStore(),
     oauth: new OAuthStore({ ...oauth, storagePath: config.dataDir ? join(config.dataDir, "oauth-store.json") : undefined }),
   };
+  sseSessionsByRuntime.set(state, new Map());
+  return state;
 }
 
 export function createMcpServer(state: RuntimeState, connectionSession?: HomeboxSession): McpServer {
@@ -64,10 +88,9 @@ export function createMcpServer(state: RuntimeState, connectionSession?: Homebox
 
 export function createHttpApp(state: RuntimeState): express.Express {
   const app = express();
-  if (state.config.trustProxy) app.set("trust proxy", true);
+  if (state.config.trustProxy) app.set("trust proxy", state.config.trustProxy);
   const bodyLimit = `${Math.ceil(state.config.maxUploadBytes * 1.5)}b`;
-  app.use(express.json({ limit: bodyLimit }));
-  app.use(express.urlencoded({ extended: false, limit: "64kb" }));
+  const mcpJsonParser = express.json({ limit: bodyLimit });
 
   registerOAuthRoutes(app, state);
 
@@ -77,7 +100,7 @@ export function createHttpApp(state: RuntimeState): express.Express {
       name: "homebox-mcp",
       transport: ["streamable-http", "sse"],
       mcpPath: state.config.mcpPath,
-      homeboxBaseUrl: state.config.homeboxBaseUrl,
+      homeboxConfigured: true,
       authRequired: Boolean(state.config.apiToken || oauthConfig(state.config).enabled),
       oauthEnabled: oauthConfig(state.config).enabled,
       oauthStorage: state.config.dataDir ? "disk" : "memory",
@@ -86,13 +109,12 @@ export function createHttpApp(state: RuntimeState): express.Express {
     });
   });
 
-  app.all(state.config.mcpPath, requireMcpAuth(state), async (req, res, next) => {
+  app.all(state.config.mcpPath, requireMcpAuth(state), mcpJsonParser, async (req, res, next) => {
     try {
       const server = createMcpServer(state, authenticatedSession(req));
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => {
-        void transport.close();
-        void server.close();
+        void Promise.allSettled([transport.close(), server.close()]);
       });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
@@ -103,20 +125,38 @@ export function createHttpApp(state: RuntimeState): express.Express {
 
   const ssePath = `${state.config.mcpPath}/sse`;
   const sseMessagesPath = `${state.config.mcpPath}/messages`;
-  const sseTransports = new Map<string, { server: McpServer; transport: SSEServerTransport }>();
+  const sseTransports = sseSessionsFor(state);
 
-  app.get(ssePath, requireMcpAuth(state), async (_req, res) => {
-    const server = createMcpServer(state, authenticatedSession(_req as Request));
+  app.get(ssePath, requireMcpAuth(state), async (req, res, next) => {
+    const principal = authenticatedPrincipal(req);
+    const connectionSession = authenticatedSession(req);
+    const account = connectionSession?.username ? `homebox:${connectionSession.username.trim().toLocaleLowerCase()}` : principal;
+    const principalSessions = [...sseTransports.values()].filter((entry) => entry.principal === principal).length;
+    const accountSessions = [...sseTransports.values()].filter((entry) => entry.account === account).length;
+    if (sseTransports.size >= MAX_SSE_SESSIONS || principalSessions >= MAX_SSE_SESSIONS_PER_PRINCIPAL || accountSessions >= MAX_SSE_SESSIONS_PER_ACCOUNT) {
+      res.status(429).json({ ok: false, error: "SSE session capacity reached; close an existing session before reconnecting" });
+      return;
+    }
+    const server = createMcpServer(state, connectionSession);
     const transport = new SSEServerTransport(sseMessagesPath, res);
-    sseTransports.set(transport.sessionId, { server, transport });
+    const entry: SseSessionEntry = { server, transport, principal, account };
+    sseTransports.set(transport.sessionId, entry);
+    entry.lifetimeTimer = setTimeout(() => {
+      void closeSseSession(sseTransports, transport.sessionId, entry).catch(() => undefined);
+    }, SSE_SESSION_MAX_LIFETIME_MS);
+    entry.lifetimeTimer.unref();
     res.on("close", () => {
-      sseTransports.delete(transport.sessionId);
-      void server.close();
+      void closeSseSession(sseTransports, transport.sessionId, entry).catch(() => undefined);
     });
-    await server.connect(transport);
+    try {
+      await server.connect(transport);
+    } catch (error) {
+      await closeSseSession(sseTransports, transport.sessionId, entry).catch(() => undefined);
+      next(error);
+    }
   });
 
-  app.post(sseMessagesPath, requireMcpAuth(state), async (req, res, next) => {
+  app.post(sseMessagesPath, requireMcpAuth(state), mcpJsonParser, async (req, res, next) => {
     try {
       const sessionId = req.query.sessionId as string;
       if (!sessionId) {
@@ -128,6 +168,10 @@ export function createHttpApp(state: RuntimeState): express.Express {
         res.status(404).json({ ok: false, error: "Unknown SSE sessionId" });
         return;
       }
+      if (entry.principal !== authenticatedPrincipal(req)) {
+        res.status(403).json({ ok: false, error: "SSE session belongs to a different authenticated principal" });
+        return;
+      }
       const { transport } = entry;
       await transport.handlePostMessage(req, res, req.body);
     } catch (error) {
@@ -135,7 +179,23 @@ export function createHttpApp(state: RuntimeState): express.Express {
     }
   });
 
-  app.use((_error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((error: unknown, req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      next(error);
+      return;
+    }
+    const bodyErrorStatus = requestBodyErrorStatus(error);
+    if (bodyErrorStatus) {
+      if (req.path.startsWith("/oauth/")) {
+        res.status(bodyErrorStatus).json({
+          error: "invalid_request",
+          error_description: bodyErrorStatus === 413 ? "Request body is too large" : "Malformed request body",
+        });
+        return;
+      }
+      res.status(bodyErrorStatus).json({ ok: false, error: bodyErrorStatus === 413 ? "Request body is too large" : "Malformed JSON request body" });
+      return;
+    }
     res.status(500).json({ ok: false, error: "Internal server error" });
   });
 
@@ -153,18 +213,26 @@ export async function startServer(config = loadConfig()): Promise<StartedServer>
   }
   const server = tls ? createHttpsServer(tls, app) : createHttpServer(app);
 
-  await new Promise<void>((resolve) => server.listen(config.port, config.host, resolve));
+  const listenHost = config.host.replace(/^\[|\]$/g, "");
+  await listen(server, config.port, listenHost);
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : config.port;
-  const host = config.host === "0.0.0.0" ? "127.0.0.1" : config.host;
-  const url = `${tls ? "https" : "http"}://${host}:${port}${config.mcpPath}`;
+  const host = listenHost === "0.0.0.0" ? "127.0.0.1" : listenHost === "::" ? "::1" : listenHost;
+  const urlHost = host.includes(":") ? `[${host}]` : host;
+  const url = `${tls ? "https" : "http"}://${urlHost}:${port}${config.mcpPath}`;
+
+  let closePromise: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    closePromise ??= closeStartedServer(state, server);
+    return closePromise;
+  };
 
   return {
     state,
     app,
     server,
     url,
-    close: () => new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+    close,
   };
 }
 
@@ -174,6 +242,7 @@ function requireMcpAuth(state: RuntimeState) {
     const oauth = oauthConfig(config);
     const provided = tokenFromRequest(req);
     if (config.apiToken && provided && safeEqual(provided, config.apiToken)) {
+      (req as AuthenticatedRequest).mcpPrincipal = "api-token";
       next();
       return;
     }
@@ -181,7 +250,9 @@ function requireMcpAuth(state: RuntimeState) {
     if (oauth.enabled) {
       const session = provided ? state.oauth.validateAccessToken(provided, resourceUrl(req, config)) : undefined;
       if (session) {
-        (req as AuthenticatedRequest).homeboxSession = session;
+        const authenticatedRequest = req as AuthenticatedRequest;
+        authenticatedRequest.homeboxSession = session;
+        authenticatedRequest.mcpPrincipal = session.sessionKey;
         next();
         return;
       }
@@ -190,6 +261,7 @@ function requireMcpAuth(state: RuntimeState) {
     }
 
     if (!config.apiToken) {
+      (req as AuthenticatedRequest).mcpPrincipal = "anonymous";
       next();
       return;
     }
@@ -199,6 +271,11 @@ function requireMcpAuth(state: RuntimeState) {
 
 function registerOAuthRoutes(app: express.Express, state: RuntimeState): void {
   if (!oauthConfig(state.config).enabled) return;
+  const oauthJsonParser = express.json({ limit: "64kb" });
+  const oauthFormParser = express.urlencoded({ extended: false, limit: "64kb", parameterLimit: 100 });
+  const registerRateLimit = rateLimit(20, 10 * 60_000);
+  const authorizeRateLimit = rateLimit(10, 5 * 60_000);
+  const tokenRateLimit = rateLimit(60, 5 * 60_000);
 
   app.get("/.well-known/oauth-protected-resource", (req, res) => {
     res.json({
@@ -225,7 +302,7 @@ function registerOAuthRoutes(app: express.Express, state: RuntimeState): void {
     });
   });
 
-  app.post("/oauth/register", (req, res) => {
+  app.post("/oauth/register", registerRateLimit, oauthJsonParser, (req, res) => {
     try {
       setNoStore(res);
       res.status(201).json(state.oauth.registerClient(req.body));
@@ -243,19 +320,20 @@ function registerOAuthRoutes(app: express.Express, state: RuntimeState): void {
     }
   });
 
-  app.post("/oauth/authorize", async (req, res) => {
+  app.post("/oauth/authorize", authorizeRateLimit, oauthFormParser, async (req, res) => {
     let auth: ReturnType<typeof authorizationRequest> | undefined;
     try {
       auth = authorizationRequest(req.body, state.oauth, resourceUrl(req, state.config));
       const username = formValue(req.body, "username");
       const password = formValue(req.body, "password");
       if (!username || !password) throw new OAuthError("invalid_request", "username and password are required");
+      if (username.length > 320 || password.length > 4_096) throw new OAuthError("invalid_request", "username or password is too long");
 
       const login = await state.homebox.login(username, password, formValue(req.body, "stayLoggedIn") !== "false");
       const code = state.oauth.createAuthorizationCode({
         ...auth,
         session: {
-          sessionKey: `oauth:${auth.clientId}`,
+          sessionKey: `oauth:${randomUUID()}`,
           token: login.token,
           username,
           expiresAt: login.expiresAt,
@@ -277,7 +355,7 @@ function registerOAuthRoutes(app: express.Express, state: RuntimeState): void {
     }
   });
 
-  app.post("/oauth/token", async (req, res) => {
+  app.post("/oauth/token", tokenRateLimit, oauthFormParser, async (req, res) => {
     try {
       setNoStore(res);
       const grantType = formValue(req.body, "grant_type");
@@ -341,7 +419,11 @@ function authenticatedSession(req: Request): HomeboxSession | undefined {
   return (req as AuthenticatedRequest).homeboxSession;
 }
 
-type AuthenticatedRequest = Request & { homeboxSession?: HomeboxSession };
+function authenticatedPrincipal(req: Request): string {
+  return (req as AuthenticatedRequest).mcpPrincipal ?? "anonymous";
+}
+
+type AuthenticatedRequest = Request & { homeboxSession?: HomeboxSession; mcpPrincipal?: string };
 
 function oauthConfig(config: AppConfig): OAuthConfig {
   return (
@@ -477,4 +559,156 @@ function safeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
   const b = Buffer.from(right);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function rateLimit(limit: number, windowMs: number, maxKeys = 2_048): RequestHandler {
+  const buckets = new Map<string, { count: number; resetAt: number }>();
+  const globalLimit = limit * 10;
+  let globalBucket = { count: 0, resetAt: Date.now() + windowMs };
+  let requestCount = 0;
+  return (req, res, next): void => {
+    const now = Date.now();
+    if (globalBucket.resetAt <= now) globalBucket = { count: 0, resetAt: now + windowMs };
+    if (++requestCount % 128 === 0 || buckets.size >= maxKeys) {
+      for (const [key, bucket] of buckets) {
+        if (bucket.resetAt <= now) buckets.delete(key);
+      }
+    }
+
+    const key = rateLimitAddress(req.ip || req.socket.remoteAddress || "unknown");
+    let bucket = buckets.get(key);
+    if (!bucket || bucket.resetAt <= now) {
+      if (!bucket && buckets.size >= maxKeys) {
+        const oldestKey = buckets.keys().next().value as string | undefined;
+        if (oldestKey) buckets.delete(oldestKey);
+      }
+      bucket = { count: 0, resetAt: now + windowMs };
+      buckets.set(key, bucket);
+    }
+    if (bucket.count >= limit || globalBucket.count >= globalLimit) {
+      setNoStore(res);
+      const resetAt = Math.max(bucket.resetAt, globalBucket.resetAt);
+      res.setHeader("Retry-After", String(Math.max(1, Math.ceil((resetAt - now) / 1_000))));
+      res.status(429).json({ error: "temporarily_unavailable", error_description: "Too many OAuth requests; retry later" });
+      return;
+    }
+    bucket.count += 1;
+    globalBucket.count += 1;
+    next();
+  };
+}
+
+function rateLimitAddress(raw: string): string {
+  const value = raw.trim();
+  const bracketed = /^\[([^\]]+)](?::\d+)?$/.exec(value);
+  const ipv4WithPort = /^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(value);
+  const address = (bracketed?.[1] ?? ipv4WithPort?.[1] ?? value).split("%", 1)[0];
+  if (isIP(address) === 0) return "invalid-forwarded-address";
+  if (isIP(address) !== 6) return address;
+  const hextets = expandIpv6(address);
+  if (hextets.length !== 8) return address;
+  if (hextets.slice(0, 5).every((part) => part === 0) && hextets[5] === 0xffff) {
+    return `${hextets[6] >> 8}.${hextets[6] & 0xff}.${hextets[7] >> 8}.${hextets[7] & 0xff}`;
+  }
+  return `${hextets.slice(0, 4).map((part) => part.toString(16).padStart(4, "0")).join(":")}::/64`;
+}
+
+function expandIpv6(raw: string): number[] {
+  let address = raw;
+  const dottedMatch = /(?:^|:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(address);
+  if (dottedMatch) {
+    const octets = dottedMatch[1].split(".").map(Number);
+    address = `${address.slice(0, -dottedMatch[1].length)}${((octets[0] << 8) | octets[1]).toString(16)}:${((octets[2] << 8) | octets[3]).toString(16)}`;
+  }
+  const [leftRaw, rightRaw] = address.split("::", 2);
+  const left = leftRaw ? leftRaw.split(":").filter(Boolean) : [];
+  const right = rightRaw ? rightRaw.split(":").filter(Boolean) : [];
+  const missing = address.includes("::") ? 8 - left.length - right.length : 0;
+  const parts = [...left, ...Array.from({ length: Math.max(0, missing) }, () => "0"), ...right];
+  return parts.length === 8 ? parts.map((part) => Number.parseInt(part, 16)) : [];
+}
+
+function requestBodyErrorStatus(error: unknown): 400 | 413 | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const parserError = error as { status?: unknown; statusCode?: unknown; type?: unknown };
+  const status = parserError.status ?? parserError.statusCode;
+  if (status === 413 || parserError.type === "entity.too.large" || parserError.type === "parameters.too.many") return 413;
+  if (status === 400 || parserError.type === "entity.parse.failed" || parserError.type === "request.size.invalid") return 400;
+  return undefined;
+}
+
+function sseSessionsFor(state: RuntimeState): Map<string, SseSessionEntry> {
+  let sessions = sseSessionsByRuntime.get(state);
+  if (!sessions) {
+    sessions = new Map();
+    sseSessionsByRuntime.set(state, sessions);
+  }
+  return sessions;
+}
+
+function closeSseSession(sessions: Map<string, SseSessionEntry>, sessionId: string, entry: SseSessionEntry): Promise<void> {
+  if (entry.closing) return entry.closing;
+  if (sessions.get(sessionId) === entry) sessions.delete(sessionId);
+  if (entry.lifetimeTimer) clearTimeout(entry.lifetimeTimer);
+  entry.closing = (async () => {
+    let failure: unknown;
+    try {
+      await entry.transport.close();
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      await entry.server.close();
+    } catch (error) {
+      failure ??= error;
+    }
+    if (failure) throw failure;
+  })();
+  return entry.closing;
+}
+
+async function closeStartedServer(state: RuntimeState, server: HttpServer | HttpsServer): Promise<void> {
+  const sessions = sseSessionsFor(state);
+  const closeResults = await Promise.allSettled(
+    [...sessions.entries()].map(([sessionId, entry]) => closeSseSession(sessions, sessionId, entry)),
+  );
+  await closeHttpServer(server);
+  const failed = closeResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failed) throw failed.reason;
+}
+
+function listen(server: HttpServer | HttpsServer, port: number, host: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error): void => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = (): void => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, host);
+  });
+}
+
+function closeHttpServer(server: HttpServer | HttpsServer, deadlineMs = 5_000): Promise<void> {
+  if (!server.listening) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      if (error) reject(error);
+      else resolve();
+    };
+    const deadline = setTimeout(() => {
+      server.closeAllConnections();
+      finish();
+    }, deadlineMs);
+    deadline.unref();
+    server.close((error) => finish(error));
+  });
 }

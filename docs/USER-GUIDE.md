@@ -42,7 +42,7 @@ Use API field names in tool payloads.
 | Tags / Tagi | `tagIds` |
 | Primary photo / thumbnail | primary attachment or `imageId` |
 
-Use `purchaseTime` (alias) or `purchaseDate` for the purchase date. Workflows emit `purchaseDate` because Homebox v0.26.2 ignores `purchaseTime` on POST/PUT/PATCH.
+Use `purchaseTime` (alias) or `purchaseDate` for the purchase date. Workflows emit `purchaseDate` because Homebox v0.26.2 ignores `purchaseTime` on POST/PUT/PATCH. Purchase, manufacturer, model, serial, notes and custom-field updates require `homebox_update_item` GET-merge-PUT; never send them through PATCH.
 
 `homebox_create_item_full` and `homebox_upsert_items_bulk` accept `customFields` as a simple `{ name: value }` object and translate it to Homebox `fields[]` with `type:"text"` and `textValue`. Non-string values are serialized as text because Homebox v0.26.2 returns 500 when `PUT /entities/{id}` receives `type:"number"` or `type:"boolean"` fields (POST create accepts them). Fields without `type` also return 500, so always include `type` when constructing `fields` manually.
 
@@ -50,7 +50,11 @@ Use `purchaseTime` (alias) or `purchaseDate` for the purchase date. Workflows em
 
 `PUT /entities/{id}` requires a full entity payload. Use `homebox_update_item` for partial updates. It reads the current entity, merges `patch`, preserves custom fields/tags and converts `parent` to `parentId`, then sends a full PUT payload.
 
-Supported `patch` fields for v0.26 entities include:
+`homebox_create_item` is intentionally strict and accepts only Homebox v0.26 POST core fields: `name`, `description`, `quantity`, `parentId`/`locationId`, `entityTypeId`, `tagIds`, `insured`, `archived`, `assetId` and `syncChildEntityLocations`/`syncChildItemsLocations`. Use `homebox_create_item_full` when purchase, manufacturer, model, serial, notes or custom fields are needed.
+
+`homebox_patch_item` and `homebox_patch_entity` require at least one mutation and accept only `entityTypeId`, `parentId`/`locationId`, `quantity` and `tagIds`. Use `homebox_update_item` for every broader change.
+
+Supported `homebox_update_item.patch` fields for v0.26 entities include:
 
 ```text
 name, description, quantity, insured, archived, assetId, serialNumber,
@@ -60,7 +64,7 @@ soldTime, soldTo, soldPrice, soldNotes, notes, parentId, entityTypeId,
 tagIds, fields, syncChildEntityLocations
 ```
 
-Example:
+`homebox_update_item` example:
 
 ```json
 {
@@ -90,7 +94,7 @@ Manual workflow when needed:
 1. Resolve location by name with `homebox_resolve_location` or `homebox_find_or_create_location`.
 2. Resolve or create tags with `homebox_resolve_tags`.
 3. Create an entity with stable fields: `name`, `description`, `quantity`, `parentId`, `tagIds`.
-4. Patch purchase and detail fields: `purchasePrice`, `purchaseTime`, `purchaseFrom`, `manufacturer`, `modelNumber`, `notes`.
+4. Update purchase and detail fields with `homebox_update_item` (safe GET-merge-PUT): `purchasePrice`, `purchaseTime`, `purchaseFrom`, `manufacturer`, `modelNumber`, `notes`. Never PATCH these fields.
 5. Upload the primary photo.
 6. Verify final fields with `homebox_get_entity`.
 
@@ -175,7 +179,7 @@ Use `homebox_resolve_tags` with `labels` or `names`. It dedupes names, prefers e
 
 ## Photos And Attachments
 
-Workflow photo tools prefer public `imageUrl` or `photoUrl` values. Local file paths are supported via the `filePath` parameter — MCP reads the file from the server filesystem, base64-encodes it, and uploads. Direct `base64` with `fileName` is the fallback when neither URL nor local file is available.
+Workflow photo tools prefer public `imageUrl` or `photoUrl` values. Server-local `filePath` is disabled unless the operator explicitly configures `HOMEBOX_MCP_LOCAL_FILE_ROOT`. The server confines resolved paths beneath that root, reads the file, base64-encodes it and uploads it. Never set this root to `HOMEBOX_MCP_DATA_DIR` or another directory containing OAuth data or secrets. Direct `base64` with `fileName` is the fallback.
 
 Use full-size product images for primary photos. Do not upload externally generated thumbnails as primary photos unless the user explicitly wants the small image.
 
@@ -183,15 +187,15 @@ Use full-size product images for primary photos. Do not upload externally genera
 
 Photo tools:
 
-- `homebox_ensure_primary_photo` (preferred for agents): idempotent. Reuses an existing photo attachment by title or content hash; only uploads a new one when no match exists. Pass `cleanupDuplicates=true` to also remove other duplicate photos.
+- `homebox_ensure_primary_photo` (preferred for agents): idempotent. Reuses an existing photo attachment by title or content hash; only uploads a new one when no match exists. Pass `cleanupDuplicates=true` to also delete other duplicate photos. Because that option deletes attachments, the tool is marked destructive.
 - `homebox_replace_primary_photo`: uploads a new primary photo and deletes the previous primary by default. Use when you want a fresh attachment and removal of the old one.
 - `homebox_upload_primary_photo_from_file`: always adds a new attachment. Does NOT replace or dedupe. Repeated calls produce duplicates — prefer `ensure_primary_photo` for set-primary operations.
-- `homebox_cleanup_duplicate_photos`: removes duplicate photo attachments, keeping one per title+mimeType group (prefers the current primary).
+- `homebox_cleanup_duplicate_photos`: removes duplicate photo attachments and always keeps one per title+mimeType group. `keepPrimary=true` prefers the current primary as keeper; `false` only disables that preference and still keeps one.
 
 `homebox_create_item_full` and `homebox_upsert_items_bulk` use the idempotent ensure path internally, so retries and duplicate workflow calls will not create duplicate photo attachments.
 
 ## Low-Level API Requests
 
-`homebox_api_request` is a low-level escape hatch. Prefer typed tools.
+`homebox_api_request` is a low-level escape hatch supporting GET, POST, PUT, PATCH and DELETE. It can mutate or delete data and is marked destructive. Prefer typed tools.
 
 Use it only when a typed tool does not expose the required endpoint or field. The caller is responsible for full Homebox payload compatibility. Absolute URLs are rejected; only relative `/api/v1/...` paths on the configured Homebox instance are allowed.

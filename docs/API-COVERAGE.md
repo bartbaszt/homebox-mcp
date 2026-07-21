@@ -21,7 +21,7 @@ When an MCP request is authenticated by OAuth, tool-level `sessionKey` and raw H
 
 - `homebox_status`: `GET /api/v1/status`.
 - `homebox_list_currencies`: `GET /api/v1/currencies`.
-- `homebox_api_request`: low-level escape hatch for relative `/api/v1/...` paths with GET/POST/PUT/PATCH/DELETE. Prefer typed tools; caller owns payload compatibility.
+- `homebox_api_request`: low-level escape hatch for relative `/api/v1/...` paths with GET/POST/PUT/PATCH/DELETE. It can mutate or delete data and is advertised with `destructiveHint:true`. Prefer typed tools; caller owns payload compatibility.
 
 ## Collections / Groups (v0.26)
 
@@ -72,15 +72,17 @@ Items and locations are unified as entities. Item tools (`homebox_list_items`, `
 
 - `homebox_list_items`: `GET /api/v1/entities` with pagination and optional `groupId`.
 - `homebox_get_item`: `GET /api/v1/entities/{id}`.
-- `homebox_create_item`: `POST /api/v1/entities`.
+- `homebox_create_item`: strict `POST /api/v1/entities` contract limited to Homebox v0.26 core create fields: `name`, `description`, `quantity`, `parentId`/`locationId`, `entityTypeId`, `tagIds`, `insured`, `archived`, `assetId`, `syncChildEntityLocations`/`syncChildItemsLocations`. It does not accept purchase, manufacturer, model, serial, notes or custom fields; use `homebox_create_item_full` for those.
 - `homebox_update_item`: GET-merge-`PUT /api/v1/entities/{id}`. Preserves fields/tags, converts `parent` to `parentId`.
 - `homebox_put_item`: direct full `PUT /api/v1/entities/{id}`.
-- `homebox_patch_item`: `PATCH /api/v1/entities/{id}` (supports `entityTypeId`, `parentId`, `quantity`, `tagIds`).
+- `homebox_patch_item`: strict `PATCH /api/v1/entities/{id}` contract requiring at least one of `entityTypeId`, `parentId`/`locationId`, `quantity`, `tagIds`; all other fields are rejected.
 - `homebox_delete_item`: `DELETE /api/v1/entities/{id}`.
 
 `homebox_update_item` accepts a `patch` object. Supported v0.26 fields include `name`, `description`, `quantity`, `insured`, `archived`, `assetId`, `serialNumber`, `modelNumber`, `manufacturer`, `lifetimeWarranty`, `warrantyExpires`, `warrantyDetails`, `purchaseTime` (emitted as `purchaseDate`), `purchaseFrom`, `purchasePrice`, `soldTime`, `soldTo`, `soldPrice`, `soldNotes`, `notes`, `parentId`, `entityTypeId`, `tagIds`, `fields`, `syncChildEntityLocations`.
 
 Use `purchaseTime` (alias) or `purchaseDate` for the purchase date; workflows emit `purchaseDate` because Homebox v0.26.2 ignores `purchaseTime` on POST/PUT/PATCH. Custom fields must include `type` plus the matching value key (`textValue`/`numberValue`/`booleanValue`); without `type`, PUT returns 500. Workflows emit `type:"text"` and serialize non-string values as text. Use `parentId` for parent location.
+
+Purchase, manufacturer, model, serial, notes and custom-field updates require `homebox_update_item`, which GETs the current entity, merges the change and PUTs the full payload. Never send these fields through `homebox_patch_item` or `homebox_patch_entity`.
 
 ## Entities
 
@@ -93,7 +95,7 @@ Use `purchaseTime` (alias) or `purchaseDate` for the purchase date; workflows em
 - `homebox_list_entities_tree`: `GET /api/v1/entities/tree` with optional `withItems`.
 - `homebox_get_entity`: `GET /api/v1/entities/{id}`.
 - `homebox_put_entity`: `PUT /api/v1/entities/{id}`.
-- `homebox_patch_entity`: `PATCH /api/v1/entities/{id}`.
+- `homebox_patch_entity`: strict `PATCH /api/v1/entities/{id}` contract requiring at least one of `entityTypeId`, `parentId`/`locationId`, `quantity`, `tagIds`; all other fields are rejected.
 - `homebox_delete_entity`: `DELETE /api/v1/entities/{id}`.
 - `homebox_duplicate_entity`: `POST /api/v1/entities/{id}/duplicate`.
 - `homebox_get_entity_path`: `GET /api/v1/entities/{id}/path`.
@@ -134,14 +136,16 @@ Use `purchaseTime` (alias) or `purchaseDate` for the purchase date; workflows em
 - `homebox_resolve_location`: lookup-focused location name/path resolver. Defaults to `createMissing=false`.
 - `homebox_find_or_create_location`: location name/path resolver that creates missing path segments by default. Locations are entities with `isLocation=true`.
 - `homebox_create_item_full`: resolves tags/location, stores external refs as custom fields, creates entity, optionally uploads a primary photo from public URL/base64. Photo upload uses the idempotent ensure path (reuses existing attachment by title or content hash) so retries do not create duplicate photos.
-- `homebox_upload_primary_photo_from_file`: uploads a new attachment and sets it as the primary entity photo. Always adds a new attachment — does NOT replace existing primary. Accepts `imageUrl`/`photoUrl` (direct image URL), `filePath` (local file on the MCP server), or `base64` with `fileName`. Use `homebox_ensure_primary_photo` for idempotent set-primary, `homebox_replace_primary_photo` to delete previous primary.
+- `homebox_upload_primary_photo_from_file`: uploads a new attachment and sets it as the primary entity photo. Always adds a new attachment — does NOT replace existing primary. Accepts `imageUrl`/`photoUrl` (direct image URL), opt-in `filePath`, or `base64` with `fileName`. Use `homebox_ensure_primary_photo` for idempotent set-primary, `homebox_replace_primary_photo` to delete previous primary.
 - `homebox_replace_primary_photo`: uploads a new primary entity photo and deletes previous primary attachments by default (`deletePreviousPrimary` defaults to `true`).
-- `homebox_ensure_primary_photo`: idempotent primary photo setter. Reuses an existing photo attachment by title (fileName) or content hash and only updates its primary flag; uploads a new attachment only when no match exists. Optional `cleanupDuplicates` removes other duplicate photo attachments.
-- `homebox_cleanup_duplicate_photos`: removes duplicate photo attachments for an entity, grouping by title+mimeType and keeping one per group (preferring the current primary).
+- `homebox_ensure_primary_photo`: idempotent primary photo setter. Reuses an existing photo attachment by title (fileName) or content hash and only updates its primary flag; uploads a new attachment only when no match exists. `cleanupDuplicates=true` deletes other duplicate photo attachments, so the tool is advertised with `destructiveHint:true`.
+- `homebox_cleanup_duplicate_photos`: removes duplicate photo attachments for an entity, grouping by title+mimeType and always keeping one per group. `keepPrimary=true` prefers the current primary as keeper; `false` only disables that preference and still keeps one.
 - `homebox_upsert_items_bulk`: creates or updates many entities; dedupe defaults to `externalAssetId`, `orderId`, then `name`. Photo uploads use the idempotent ensure path.
 - `homebox_import_items_bulk`: import-oriented alias for bulk upsert, useful for sources such as AliExpress orders.
 
 Workflow entity fields include `name`, `description`, `quantity`, `purchaseTime`, `purchaseFrom`, `purchasePrice`, `manufacturer`, `modelNumber`, `serialNumber`, `notes`, `labels`, `externalAssetId`, `orderId`, `sourceUrls`, `photoUrl` and `parentId` (via `locationId`/`locationName`).
+
+Workflow `filePath` photo input is disabled unless the operator configures `HOMEBOX_MCP_LOCAL_FILE_ROOT`. Resolved paths are confined beneath that root. Never configure the OAuth `HOMEBOX_MCP_DATA_DIR`, or any directory containing secrets, as the local-file root.
 
 ## Locations, Tags, Fields
 
@@ -149,7 +153,7 @@ Locations are entities queried via `/api/v1/entities?isLocation=true`.
 
 - `homebox_list_locations`: `GET /api/v1/entities?isLocation=true`.
 - `homebox_create_location`: `POST /api/v1/entities` with `isLocation=true`.
-- `homebox_update_location`: `PUT /api/v1/entities/{id}`.
+- `homebox_update_location`: safe GET-merge-`PUT /api/v1/entities/{id}` preserving parent, tags and custom fields.
 - `homebox_delete_location`: `DELETE /api/v1/entities/{id}`.
 - `homebox_list_tags`: `GET /api/v1/tags`.
 - `homebox_get_tag`: `GET /api/v1/tags/{id}` (v0.26).

@@ -7,12 +7,15 @@
 // (at your option) any later version.
 
 import { lookup as dnsLookup } from "node:dns/promises";
+import { constants as fsConstants } from "node:fs";
+import { open, realpath, stat, type FileHandle } from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import tls from "node:tls";
 import { isIP } from "node:net";
 import type { IncomingMessage } from "node:http";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 
 import { HomeboxMcpError } from "./errors.js";
 
@@ -31,6 +34,13 @@ export interface RequestOptions {
   query?: Record<string, QueryValue>;
   body?: unknown;
   headers?: Record<string, string>;
+}
+
+export interface LocalPhotoFile {
+  fileName: string;
+  contentType: string;
+  contentLength: number;
+  base64: string;
 }
 
 export interface DownloadedAttachment {
@@ -83,6 +93,8 @@ export interface UploadCsvInput {
 }
 
 const API_PREFIX = "/api/v1/";
+const BLOCKED_IPV6 = createBlockedIpv6List();
+const GLOBAL_IPV6 = createGlobalIpv6List();
 
 export class HomeboxClient {
   constructor(
@@ -90,6 +102,7 @@ export class HomeboxClient {
     private readonly timeoutMs: number,
     private readonly maxUploadBytes: number,
     private readonly maxDownloadBytes: number,
+    private readonly localFileRoot?: string,
   ) {}
 
   async status(): Promise<unknown> {
@@ -309,7 +322,7 @@ export class HomeboxClient {
   }
 
   async createItem(token: string, body: JsonObject): Promise<unknown> {
-    return this.createEntity(token, body);
+    return this.createEntity(token, normalizeEntityPayload(body));
   }
 
   async exportEntities(token: string): Promise<DownloadedFile> {
@@ -479,7 +492,25 @@ export class HomeboxClient {
   }
 
   async listLocations(token: string): Promise<unknown> {
-    return this.request("GET", "/api/v1/entities", { token, query: { isLocation: true, pageSize: 500 } });
+    const pageSize = 500;
+    let page = 1;
+    const first = await this.request("GET", "/api/v1/entities", { token, query: { isLocation: true, page, pageSize } });
+    if (Array.isArray(first)) return first;
+    const firstRecord = objectRecord(first);
+    if (!firstRecord || !Array.isArray(firstRecord.items)) return first;
+
+    const items = [...firstRecord.items];
+    const total = typeof firstRecord.total === "number" ? firstRecord.total : undefined;
+    let lastPageSize = firstRecord.items.length;
+    while ((total !== undefined ? items.length < total : lastPageSize === pageSize) && page < 10_000) {
+      page += 1;
+      const next = objectRecord(await this.request("GET", "/api/v1/entities", { token, query: { isLocation: true, page, pageSize } }));
+      const nextItems = Array.isArray(next?.items) ? next.items : [];
+      items.push(...nextItems);
+      lastPageSize = nextItems.length;
+      if (lastPageSize === 0) break;
+    }
+    return { ...firstRecord, page: 1, pageSize, total: total ?? items.length, items };
   }
 
   async createLocation(token: string, body: JsonObject): Promise<unknown> {
@@ -487,7 +518,8 @@ export class HomeboxClient {
   }
 
   async updateLocation(token: string, locationId: string, body: JsonObject): Promise<unknown> {
-    return this.request("PUT", `/api/v1/entities/${encodeURIComponent(locationId)}`, { token, body });
+    const current = await this.getEntity(token, locationId);
+    return this.putEntity(token, locationId, mergeEntityForPut(current, body));
   }
 
   async deleteLocation(token: string, locationId: string): Promise<unknown> {
@@ -571,47 +603,85 @@ export class HomeboxClient {
   }
 
   async fetchPublicUrlFile(url: string, fileName?: string, contentType?: string): Promise<PublicUrlFile> {
-    let current = publicHttpUrl(url);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-    try {
-      for (let redirects = 0; redirects <= 5; redirects += 1) {
-        const response = await requestPublicUrl(current, controller.signal);
-        if (![301, 302, 303, 307, 308].includes(response.statusCode ?? 0)) {
-          if ((response.statusCode ?? 0) < 200 || (response.statusCode ?? 0) >= 300) throw new HomeboxMcpError("network", `Public URL fetch failed (${response.statusCode})`);
-          const responseContentType = headerValue(response.headers["content-type"])?.split(";")[0].trim().toLowerCase();
-          if (responseContentType === "text/html" || responseContentType === "application/xhtml+xml") {
-            response.resume();
-            throw new HomeboxMcpError("validation", `photoUrl is not a direct image URL; got ${responseContentType}. The URL must point to an image file (image/jpeg, image/png, image/webp), not a product page. Store product page URLs in sourceUrls/notes instead.`);
-          }
-          const contentLengthHeader = headerValue(response.headers["content-length"]);
-          const advertisedLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : undefined;
-          if (advertisedLength && advertisedLength > this.maxUploadBytes) {
-            throw new HomeboxMcpError("validation", `Public URL content exceeds HOMEBOX_MCP_MAX_UPLOAD_BYTES (${this.maxUploadBytes})`);
-          }
-          const buffer = await readIncomingLimited(response, this.maxUploadBytes, `Public URL content exceeds HOMEBOX_MCP_MAX_UPLOAD_BYTES (${this.maxUploadBytes})`);
-          return {
-            url: current.toString(),
-            fileName: safeFileName(fileName ?? fileNameFromUrl(current) ?? "photo"),
-            contentType: contentType ?? headerValue(response.headers["content-type"])?.split(";")[0].trim() ?? undefined,
-            contentLength: buffer.byteLength,
-            base64: buffer.toString("base64"),
-          };
-        }
-        response.resume();
-        const location = headerValue(response.headers.location);
-        if (!location) throw new HomeboxMcpError("validation", "Public URL redirect did not include Location header");
-        current = publicHttpUrl(new URL(location, current).toString());
-      }
-
-      throw new HomeboxMcpError("validation", "Public URL redirect limit exceeded");
-    } catch (error) {
-      if (error instanceof HomeboxMcpError) throw error;
-      if ((error as Error).name === "AbortError") throw new HomeboxMcpError("network", `Public URL fetch timed out after ${this.timeoutMs}ms`);
-      throw new HomeboxMcpError("network", `Public URL fetch failed: ${(error as Error).message}`);
-    } finally {
-      clearTimeout(timeout);
+    const fetched = await fetchPublicUrlLimited(url, this.timeoutMs, this.maxUploadBytes, "Public URL content exceeds HOMEBOX_MCP_MAX_UPLOAD_BYTES");
+    const responseContentType = mediaType(headerValue(fetched.headers["content-type"]));
+    if (responseContentType === "text/html" || responseContentType === "application/xhtml+xml") {
+      throw new HomeboxMcpError("validation", `photoUrl is not a direct image URL; got ${responseContentType}. The URL must point to an image file (image/jpeg, image/png, image/webp), not a product page. Store product page URLs in sourceUrls/notes instead.`);
     }
+    const detectedType = detectImageContentType(fetched.buffer);
+    if (!detectedType) throw new HomeboxMcpError("validation", "photoUrl did not return a recognized image file");
+    if (contentType) assertMatchingImageContentType(contentType, detectedType);
+    if (responseContentType?.startsWith("image/")) assertMatchingImageContentType(responseContentType, detectedType);
+    return {
+      url: fetched.url.toString(),
+      fileName: safeFileName(fileName ?? fileNameFromUrl(fetched.url) ?? "photo"),
+      contentType: detectedType,
+      contentLength: fetched.buffer.byteLength,
+      base64: fetched.buffer.toString("base64"),
+    };
+  }
+
+  async readLocalPhotoFile(filePath: string, fileName?: string, contentType?: string): Promise<LocalPhotoFile> {
+    if (!this.localFileRoot) {
+      throw new HomeboxMcpError("validation", "filePath is disabled. Configure HOMEBOX_MCP_LOCAL_FILE_ROOT to enable local photo uploads.");
+    }
+    const root = resolve(this.localFileRoot);
+    const requestedPath = isAbsolute(filePath) ? filePath : resolve(root, filePath);
+    const resolvedPath = await realpath(requestedPath);
+    if (!pathIsWithin(root, resolvedPath)) {
+      throw new HomeboxMcpError("validation", "filePath must resolve beneath HOMEBOX_MCP_LOCAL_FILE_ROOT");
+    }
+
+    const expected = await stat(resolvedPath);
+    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+    const handle = await open(resolvedPath, fsConstants.O_RDONLY | noFollow);
+    try {
+      const openedPath = await realpath(requestedPath);
+      if (openedPath !== resolvedPath || !pathIsWithin(root, openedPath)) {
+        throw new HomeboxMcpError("validation", "filePath changed while it was being opened");
+      }
+      const info = await handle.stat();
+      if (info.dev !== expected.dev || info.ino !== expected.ino) {
+        throw new HomeboxMcpError("validation", "filePath changed while it was being opened");
+      }
+      if (!info.isFile()) throw new HomeboxMcpError("validation", "filePath must reference a regular file");
+      if (info.size > this.maxUploadBytes) {
+        throw new HomeboxMcpError("validation", `Local file exceeds HOMEBOX_MCP_MAX_UPLOAD_BYTES (${this.maxUploadBytes})`);
+      }
+      const buffer = await readFileHandleLimited(handle, this.maxUploadBytes);
+      const detectedType = detectImageContentType(buffer);
+      if (!detectedType) throw new HomeboxMcpError("validation", "filePath must contain a recognized image file");
+      assertMatchingImageContentType(contentType, detectedType);
+      return {
+        fileName: safeFileName(fileName ?? basename(resolvedPath)),
+        contentType: detectedType,
+        contentLength: buffer.byteLength,
+        base64: buffer.toString("base64"),
+      };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  validateBase64Photo(base64: string, fileName: string, contentType?: string): LocalPhotoFile {
+    const compact = base64.replace(/\s/g, "");
+    const maxEncodedLength = Math.ceil(this.maxUploadBytes / 3) * 4;
+    if (compact.length > maxEncodedLength || compact.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(compact)) {
+      throw new HomeboxMcpError("validation", "base64 must be valid image data within HOMEBOX_MCP_MAX_UPLOAD_BYTES");
+    }
+    const buffer = Buffer.from(compact, "base64");
+    if (buffer.byteLength > this.maxUploadBytes) {
+      throw new HomeboxMcpError("validation", `Upload exceeds HOMEBOX_MCP_MAX_UPLOAD_BYTES (${this.maxUploadBytes})`);
+    }
+    const detectedType = detectImageContentType(buffer);
+    if (!detectedType) throw new HomeboxMcpError("validation", "base64 must contain a recognized JPEG, PNG or WebP image");
+    assertMatchingImageContentType(contentType, detectedType);
+    return {
+      fileName: safeFileName(fileName),
+      contentType: detectedType,
+      contentLength: buffer.byteLength,
+      base64: buffer.toString("base64"),
+    };
   }
 
   async apiRequest(method: string, path: string, options: RequestOptions = {}): Promise<unknown> {
@@ -619,21 +689,22 @@ export class HomeboxClient {
   }
 
   private async request<T = unknown>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
-    const response = await this.rawRequest(method, path, options);
-    if (response.status === 204) return undefined as T;
-    const contentType = response.headers.get("content-type") ?? "";
-    if (contentType.includes("application/json")) return response.json() as Promise<T>;
-    return response.text() as Promise<T>;
+    return this.rawRequest(method, path, options, false, async (response) => {
+      if (response.status === 204) return undefined as T;
+      const contentType = response.headers.get("content-type") ?? "";
+      if (contentType.includes("application/json")) return response.json() as Promise<T>;
+      return response.text() as Promise<T>;
+    });
   }
 
-  private async rawRequest(method: string, path: string, options: RequestOptions = {}): Promise<Response> {
+  private async rawRequest<T>(method: string, path: string, options: RequestOptions, allowRedirect: boolean, consume: (response: Response) => Promise<T>): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
       const headers = new Headers(options.headers);
       if (options.token) headers.set("Authorization", authHeader(options.token));
       const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
-      const init: RequestInit = { method: method.toUpperCase(), headers, signal: controller.signal };
+      const init: RequestInit = { method: method.toUpperCase(), headers, signal: controller.signal, redirect: "manual" };
       if (options.body !== undefined) {
         if (isFormData) {
           init.body = options.body as BodyInit;
@@ -644,8 +715,8 @@ export class HomeboxClient {
       }
 
       const response = await fetch(this.url(path, options.query), init);
-      if (!response.ok) await this.throwResponseError(response);
-      return response;
+      if (!response.ok && !(allowRedirect && isRedirectStatus(response.status))) await this.throwResponseError(response);
+      return await consume(response);
     } catch (error) {
       if (error instanceof HomeboxMcpError) throw error;
       if ((error as Error).name === "AbortError") throw new HomeboxMcpError("network", `Homebox API timed out after ${this.timeoutMs}ms`);
@@ -680,23 +751,38 @@ export class HomeboxClient {
   private safeApiPath(path: string): string {
     if (/^https?:\/\//i.test(path)) throw new HomeboxMcpError("validation", "Path must be relative, not an absolute URL");
     const normalized = path.startsWith("/") ? path : `/${path}`;
-    if (!normalized.startsWith(API_PREFIX)) {
+    const rawPath = normalized.split(/[?#]/, 1)[0];
+    if (normalized.includes("#") || rawPath.includes("\\") || /%(?:2e|2f|5c|25)/i.test(rawPath)) {
+      throw new HomeboxMcpError("validation", "Path must not contain fragments, backslashes, encoded separators, or encoded dot segments");
+    }
+    const base = new URL(this.baseUrl);
+    const resolved = new URL(normalized, base);
+    if (resolved.origin !== base.origin || !resolved.pathname.startsWith(API_PREFIX)) {
       throw new HomeboxMcpError("validation", "Path must start with /api/v1/");
     }
-    return normalized;
+    return `${resolved.pathname}${resolved.search}`;
   }
 
   private async downloadFile(path: string, token: string): Promise<DownloadedFile> {
-    const response = await this.rawRequest("GET", path, { token });
-    const contentLengthHeader = response.headers.get("content-length");
-    const advertisedLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : undefined;
-    if (advertisedLength && advertisedLength > this.maxDownloadBytes) {
-      throw new HomeboxMcpError("validation", `Download exceeds HOMEBOX_MCP_MAX_DOWNLOAD_BYTES (${this.maxDownloadBytes})`);
-    }
-    const buffer = await readFetchResponseLimited(response, this.maxDownloadBytes, `Download exceeds HOMEBOX_MCP_MAX_DOWNLOAD_BYTES (${this.maxDownloadBytes})`);
-    const contentType = response.headers.get("content-type") ?? undefined;
-    const text = contentType && /^(text\/|application\/(json|xml|csv)|.*\+json)/i.test(contentType) ? buffer.toString("utf8") : undefined;
-    return { contentType, contentLength: buffer.byteLength, base64: buffer.toString("base64"), text };
+    return this.rawRequest("GET", path, { token }, true, async (response) => {
+      if (isRedirectStatus(response.status)) {
+        await response.body?.cancel().catch(() => undefined);
+        const location = response.headers.get("location");
+        if (!location) throw new HomeboxMcpError("validation", "Download redirect did not include Location header");
+        const target = new URL(location, response.url || this.url(path));
+        const fetched = await fetchPublicUrlLimited(target.toString(), this.timeoutMs, this.maxDownloadBytes, "Download exceeds HOMEBOX_MCP_MAX_DOWNLOAD_BYTES");
+        return downloadedFile(fetched.buffer, headerValue(fetched.headers["content-type"]));
+      }
+
+      const contentLengthHeader = response.headers.get("content-length");
+      const advertisedLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : undefined;
+      if (advertisedLength && advertisedLength > this.maxDownloadBytes) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new HomeboxMcpError("validation", `Download exceeds HOMEBOX_MCP_MAX_DOWNLOAD_BYTES (${this.maxDownloadBytes})`);
+      }
+      const buffer = await readFetchResponseLimited(response, this.maxDownloadBytes, `Download exceeds HOMEBOX_MCP_MAX_DOWNLOAD_BYTES (${this.maxDownloadBytes})`);
+      return downloadedFile(buffer, response.headers.get("content-type") ?? undefined);
+    });
   }
 
   private multipartFile(fieldName: string, fileName: string, base64: string, contentType?: string, fields: Record<string, unknown> = {}): FormData {
@@ -720,17 +806,23 @@ export function authHeader(token: string): string {
 }
 
 async function requestPublicUrl(url: URL, signal: AbortSignal): Promise<IncomingMessage> {
-  const { address } = await resolveSafeAddress(url.hostname);
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  const { address } = await resolveSafeAddress(hostname);
   const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
   const isTls = url.protocol === "https:";
   const createConnection = () => {
     const socket = net.createConnection({ host: address, port, signal });
     if (!isTls) return socket;
-    return tls.connect({ socket, servername: url.hostname, rejectUnauthorized: true });
+    return tls.connect({
+      socket,
+      servername: isIP(hostname) ? undefined : hostname,
+      rejectUnauthorized: true,
+      checkServerIdentity: (_serverName, certificate) => tls.checkServerIdentity(hostname, certificate),
+    });
   };
   const options: https.RequestOptions = {
     protocol: url.protocol,
-    hostname: url.hostname,
+    hostname,
     port,
     path: `${url.pathname}${url.search}`,
     method: "GET",
@@ -745,6 +837,43 @@ async function requestPublicUrl(url: URL, signal: AbortSignal): Promise<Incoming
     req.on("error", reject);
     req.end();
   });
+}
+
+async function fetchPublicUrlLimited(rawUrl: string, timeoutMs: number, limit: number, limitLabel: string): Promise<{ url: URL; headers: IncomingMessage["headers"]; buffer: Buffer }> {
+  let current = publicHttpUrl(rawUrl);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    for (let redirects = 0; redirects <= 5; redirects += 1) {
+      const response = await requestPublicUrl(current, controller.signal);
+      if (isRedirectStatus(response.statusCode ?? 0)) {
+        response.resume();
+        const location = headerValue(response.headers.location);
+        if (!location) throw new HomeboxMcpError("validation", "Public URL redirect did not include Location header");
+        current = publicHttpUrl(new URL(location, current).toString());
+        continue;
+      }
+      if ((response.statusCode ?? 0) < 200 || (response.statusCode ?? 0) >= 300) {
+        response.resume();
+        throw new HomeboxMcpError("network", `Public URL fetch failed (${response.statusCode})`);
+      }
+      const contentLengthHeader = headerValue(response.headers["content-length"]);
+      const advertisedLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : undefined;
+      if (advertisedLength && advertisedLength > limit) {
+        response.destroy();
+        throw new HomeboxMcpError("validation", `${limitLabel} (${limit})`);
+      }
+      const buffer = await readIncomingLimited(response, limit, `${limitLabel} (${limit})`);
+      return { url: current, headers: response.headers, buffer };
+    }
+    throw new HomeboxMcpError("validation", "Public URL redirect limit exceeded");
+  } catch (error) {
+    if (error instanceof HomeboxMcpError) throw error;
+    if ((error as Error).name === "AbortError") throw new HomeboxMcpError("network", `Public URL fetch timed out after ${timeoutMs}ms`);
+    throw new HomeboxMcpError("network", `Public URL fetch failed: ${(error as Error).message}`);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function resolveSafeAddress(hostname: string, family?: number): Promise<{ address: string; family: 4 | 6 }> {
@@ -796,6 +925,55 @@ async function readIncomingLimited(response: IncomingMessage, limit: number, mes
     chunks.push(buffer);
   }
   return Buffer.concat(chunks, total);
+}
+
+async function readFileHandleLimited(handle: FileHandle, limit: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (true) {
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, limit + 1 - total));
+    const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, total);
+    if (bytesRead === 0) break;
+    total += bytesRead;
+    if (total > limit) throw new HomeboxMcpError("validation", `Local file exceeds HOMEBOX_MCP_MAX_UPLOAD_BYTES (${limit})`);
+    chunks.push(chunk.subarray(0, bytesRead));
+  }
+  return Buffer.concat(chunks, total);
+}
+
+function downloadedFile(buffer: Buffer, contentType: string | undefined): DownloadedFile {
+  const text = contentType && /^(text\/|application\/(json|xml|csv)|.*\+json)/i.test(contentType) ? buffer.toString("utf8") : undefined;
+  return { contentType, contentLength: buffer.byteLength, base64: buffer.toString("base64"), text };
+}
+
+function mediaType(value: string | undefined): string | undefined {
+  return value?.split(";", 1)[0].trim().toLowerCase() || undefined;
+}
+
+function detectImageContentType(buffer: Buffer): string | undefined {
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (buffer.length >= 12 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") return "image/webp";
+  return undefined;
+}
+
+function assertMatchingImageContentType(provided: string | undefined, detected: string): void {
+  const normalized = mediaType(provided);
+  if (!normalized) return;
+  const aliases: Record<string, string> = { "image/jpg": "image/jpeg", "image/pjpeg": "image/jpeg", "image/x-png": "image/png" };
+  if ((aliases[normalized] ?? normalized) !== detected) {
+    throw new HomeboxMcpError("validation", `Image Content-Type ${normalized} does not match detected file type ${detected}`);
+  }
+}
+
+function pathIsWithin(root: string, candidate: string): boolean {
+  const normalize = (value: string) => process.platform === "win32" ? value.toLowerCase() : value;
+  const fromRoot = relative(normalize(root), normalize(candidate));
+  return fromRoot === "" || (fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot));
+}
+
+function isRedirectStatus(status: number): boolean {
+  return [301, 302, 303, 307, 308].includes(status);
 }
 
 function headerValue(value: string | string[] | number | undefined): string | undefined {
@@ -901,20 +1079,31 @@ function normalizeEntityPatch(body: JsonObject): JsonObject {
 }
 
 function mergeFields(existing: unknown[], incoming: unknown[]): unknown[] {
-  const keys = new Set(incoming.map(fieldKey).filter((key): key is string => Boolean(key)));
-  return [
-    ...existing.filter((field) => {
-      const key = fieldKey(field);
-      return key ? !keys.has(key) : true;
-    }),
-    ...incoming,
-  ];
+  const used = new Set<number>();
+  const merged = existing.map((current) => {
+    const matchIndex = incoming.findIndex((candidate, index) => !used.has(index) && fieldsMatch(current, candidate));
+    if (matchIndex < 0) return current;
+    used.add(matchIndex);
+    const currentRecord = objectRecord(current);
+    const incomingRecord = objectRecord(incoming[matchIndex]);
+    if (!currentRecord || !incomingRecord) return incoming[matchIndex];
+    const replacement: JsonObject = { ...currentRecord, ...incomingRecord };
+    if (incomingRecord.id !== undefined || currentRecord.id !== undefined) replacement.id = currentRecord.id ?? incomingRecord.id;
+    return replacement;
+  });
+  return [...merged, ...incoming.filter((_, index) => !used.has(index))];
 }
 
-function fieldKey(value: unknown): string | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const field = value as JsonObject;
-  return typeof field.id === "string" ? `id:${field.id}` : typeof field.name === "string" ? `name:${field.name}` : undefined;
+function fieldsMatch(left: unknown, right: unknown): boolean {
+  const a = objectRecord(left);
+  const b = objectRecord(right);
+  if (!a || !b) return false;
+  if (typeof a.id === "string" && typeof b.id === "string" && a.id === b.id) return true;
+  return typeof a.name === "string" && typeof b.name === "string" && a.name.trim().toLocaleLowerCase() === b.name.trim().toLocaleLowerCase();
+}
+
+function objectRecord(value: unknown): JsonObject | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
 }
 
 function normalizeTokenResponse(response: LoginResponse, operation: string): LoginResponse {
@@ -965,15 +1154,35 @@ function isBlockedIpv4(host: string): boolean {
 }
 
 function isBlockedIpv6(host: string): boolean {
-  if (host.startsWith("::ffff:")) return isBlockedIpv4(host.slice(7));
-  const first = Number.parseInt(host.split(":", 1)[0] || "0", 16);
-  return (
-    host === "::" ||
-    host === "::1" ||
-    host.startsWith("2001:db8") ||
-    host.startsWith("fc") ||
-    host.startsWith("fd") ||
-    (first >= 0xfe80 && first <= 0xfebf) ||
-    (first >= 0xff00 && first <= 0xffff)
-  );
+  return !GLOBAL_IPV6.check(host, "ipv6") || BLOCKED_IPV6.check(host, "ipv6") || host.toLowerCase().includes(":5efe:");
+}
+
+function createGlobalIpv6List(): net.BlockList {
+  const list = new net.BlockList();
+  list.addSubnet("2000::", 3, "ipv6");
+  return list;
+}
+
+function createBlockedIpv6List(): net.BlockList {
+  const list = new net.BlockList();
+  const ranges: Array<[string, number]> = [
+    ["::", 96],
+    ["::", 128],
+    ["::1", 128],
+    ["::ffff:0:0", 96],
+    ["64:ff9b::", 96],
+    ["64:ff9b:1::", 48],
+    ["100::", 64],
+    ["2001::", 23],
+    ["2001:db8::", 32],
+    ["2002::", 16],
+    ["3fff::", 20],
+    ["5f00::", 16],
+    ["fc00::", 7],
+    ["fec0::", 10],
+    ["fe80::", 10],
+    ["ff00::", 8],
+  ];
+  for (const [network, prefix] of ranges) list.addSubnet(network, prefix, "ipv6");
+  return list;
 }

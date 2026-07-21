@@ -92,7 +92,7 @@ For ChatGPT Apps/Connectors, enable OAuth instead of asking the model to call `h
 ```powershell
 $env:HOMEBOX_MCP_OAUTH_ENABLED = "true"
 $env:HOMEBOX_MCP_PUBLIC_URL = "https://mcp.example.com/mcp"
-$env:HOMEBOX_MCP_TRUST_PROXY = "true" # when behind reverse proxy/tunnel
+$env:HOMEBOX_MCP_TRUST_PROXY = "127.0.0.1,::1" # exact reverse-proxy addresses/CIDRs
 $env:HOMEBOX_MCP_DATA_DIR = "C:\homebox-mcp-data" # persist OAuth clients/tokens across restarts
 npm start
 ```
@@ -115,6 +115,10 @@ Optional OAuth env:
 - `HOMEBOX_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS`: refresh token lifetime, default `2592000`.
 - `HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP`: local/test escape hatch; do not use in production.
 - `HOMEBOX_MCP_DATA_DIR`: optional writable directory for `oauth-store.json`. Set this for ChatGPT connectors so OAuth client registrations and tokens survive restarts.
+
+Optional local photo access:
+
+- `HOMEBOX_MCP_LOCAL_FILE_ROOT`: optional root enabling workflow `filePath` photo uploads. Without it, `filePath` is disabled. Resolved files must remain beneath this root. Never point it at `HOMEBOX_MCP_DATA_DIR` or another directory containing OAuth data or secrets.
 
 ChatGPT connects to the public `/mcp` URL. On first auth, the browser form logs into Homebox once, the password is discarded, and ChatGPT stores the OAuth token pair in connector settings. Tool calls can then omit `sessionKey` and raw Homebox tokens.
 
@@ -169,9 +173,9 @@ With static MCP auth or local agents:
 - Locations/tags/fields: `homebox_list_locations`, `homebox_create_location`, `homebox_update_location`, `homebox_delete_location`, `homebox_list_tags`, `homebox_get_tag`, `homebox_update_tag`, `homebox_delete_tag`, `homebox_list_custom_fields`, `homebox_list_custom_field_values` (requires `field`).
 - User/API keys: `homebox_get_user_self`, `homebox_update_user_self`, `homebox_delete_user_self`, `homebox_get_user_settings`, `homebox_update_user_settings`, `homebox_change_password`, `homebox_list_api_keys`, `homebox_create_api_key`, `homebox_delete_api_key`.
 - Assets/barcode/QR: `homebox_get_asset_by_asset_id`, `homebox_search_from_barcode`, `homebox_create_qr_code`.
-- Workflows: `homebox_resolve_tags`, `homebox_resolve_location`, `homebox_find_or_create_location`, `homebox_create_item_full`, `homebox_upload_primary_photo_from_file`, `homebox_replace_primary_photo`, `homebox_upsert_items_bulk`, `homebox_import_items_bulk`.
+- Workflows: `homebox_resolve_tags`, `homebox_resolve_location`, `homebox_find_or_create_location`, `homebox_create_item_full`, `homebox_upload_primary_photo_from_file`, `homebox_replace_primary_photo`, `homebox_ensure_primary_photo`, `homebox_cleanup_duplicate_photos`, `homebox_upsert_items_bulk`, `homebox_import_items_bulk`.
 
-Workflow photo tools prefer public `imageUrl`/`photoUrl` values. Local paths such as `/mnt/data/...` are not supported; direct `base64` is only a fallback.
+Workflow photo tools prefer public `imageUrl`/`photoUrl` values. Server-local `filePath` is an explicit operator opt-in: it is disabled unless `HOMEBOX_MCP_LOCAL_FILE_ROOT` is configured, and resolved paths are confined beneath that root. Never expose `HOMEBOX_MCP_DATA_DIR` through this setting. Direct `base64` is the fallback.
 
 Homebox UI field mapping for item/entity tools:
 
@@ -188,14 +192,14 @@ Homebox UI field mapping for item/entity tools:
 | Tags / Tagi | `tagIds` |
 | Primary photo / thumbnail | primary attachment / `imageId` |
 
-Use `purchaseTime` (alias) or `purchaseDate` for the purchase date. Workflows emit `purchaseDate` because Homebox v0.26.2 ignores `purchaseTime` on POST/PUT/PATCH. Use `parentId` for the parent location. `customFields` accepts a simple `{ name: value }` object; workflows emit Homebox `fields[]` with `type:"text"` (Homebox v0.26.2 PUT 500s on `type:"number"`/`type:"boolean"`).
+Use `purchaseTime` (alias) or `purchaseDate` for the purchase date. Workflows emit `purchaseDate` because Homebox v0.26.2 ignores `purchaseTime` on POST/PUT/PATCH. Purchase/manufacturer/model/serial/notes/custom-field updates require `homebox_update_item` GET-merge-PUT, never PATCH. Use `parentId` for the parent location. `customFields` accepts a simple `{ name: value }` object; workflows emit Homebox `fields[]` with `type:"text"` (Homebox v0.26.2 PUT 500s on `type:"number"`/`type:"boolean"`).
 
 Recommended purchase/import workflow:
 
 1. Resolve location by name with `homebox_resolve_location` or `homebox_find_or_create_location`.
 2. Resolve or create tags with `homebox_resolve_tags`.
 3. Create an entity with stable fields: `name`, `description`, `quantity`, `parentId`, `tagIds`.
-4. Patch `purchasePrice`, `purchaseTime`, `purchaseFrom`, `manufacturer`, `modelNumber`, `notes`.
+4. Update `purchasePrice`, `purchaseTime`, `purchaseFrom`, `manufacturer`, `modelNumber`, `notes` with `homebox_update_item` (safe GET-merge-PUT), never PATCH.
 5. Upload the primary photo.
 6. Verify final fields with `homebox_get_entity`.
 
@@ -219,7 +223,10 @@ This server targets Homebox v0.26.x (Entity Merge API). Items and locations are 
 
 Update rules:
 
+- `homebox_create_item` has a strict Homebox v0.26 POST schema limited to `name`, `description`, `quantity`, `parentId`/`locationId`, `entityTypeId`, `tagIds`, `insured`, `archived`, `assetId` and `syncChildEntityLocations`/`syncChildItemsLocations`. Use `homebox_create_item_full` when purchase, manufacturer, model, serial, notes or custom fields are needed.
+- `homebox_patch_item` and `homebox_patch_entity` require at least one mutation and accept only `entityTypeId`, `parentId`/`locationId`, `quantity` and `tagIds`.
 - `homebox_update_item` reads the current entity, merges `patch`, preserves fields/tags and converts `parent` to `parentId`, then PUTs a full payload because partial PUT can drop fields.
+- Homebox v0.26 purchase, manufacturer, model, serial, notes and custom-field updates require `homebox_update_item` GET-merge-PUT. Never send these fields through PATCH.
 - Homebox `assetId` may be auto-generated. External order IDs such as AliExpress `AE-*` should usually be stored in `notes` or custom fields unless overwriting `assetId` is known to work.
 
 ## Tests

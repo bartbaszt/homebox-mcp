@@ -1,15 +1,21 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { afterEach, describe, expect, it } from "vitest";
 
-import { authHeader, HomeboxClient, mergeEntityForPut } from "../../src/homebox-client.js";
+import { authHeader, HomeboxClient, mergeEntityForPut, publicHttpUrl } from "../../src/homebox-client.js";
 import { normalizeHomeboxUrl } from "../../src/config.js";
 import { HomeboxMcpError } from "../../src/errors.js";
 import { json, startMockHomebox, type MockHomeboxServer } from "../support/mock-homebox.js";
 
 let mock: MockHomeboxServer | undefined;
+const tempDirs: string[] = [];
 
 afterEach(async () => {
   await mock?.close();
   mock = undefined;
+  for (const path of tempDirs.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
 describe("Homebox client", () => {
@@ -190,7 +196,7 @@ describe("Homebox client", () => {
     await expect(client.getEntity("token", "entity-1")).resolves.toMatchObject({ id: "entity-1" });
     await expect(client.listEntityAttachments("token", "entity-1")).resolves.toEqual([{ id: "att-1" }]);
     await expect(client.putEntity("token", "entity-1", { name: "Drill" })).resolves.toMatchObject({ name: "Drill" });
-    await expect(client.patchEntity("token", "entity-1", { quantity: 2 })).resolves.toMatchObject({ quantity: 2 });
+    await expect(client.patchEntity("token", "entity-1", { quantity: 0 })).resolves.toMatchObject({ quantity: 0 });
     await expect(client.duplicateEntity("token", "entity-1", { copyAttachments: true })).resolves.toMatchObject({ id: "entity-2" });
     await expect(client.getEntityPath("token", "entity-1")).resolves.toEqual([{ id: "entity-1", name: "Drill", type: "item" }]);
     await expect(client.uploadEntityAttachment({ token: "token", entityId: "entity-1", fileName: "manual.txt", base64: fileBase64, primary: true })).resolves.toMatchObject({ id: "att-1" });
@@ -232,6 +238,19 @@ describe("Homebox client", () => {
     const client = new HomeboxClient(mock.url, 5_000, 1024, 1024);
     await expect(client.listLocations("token")).resolves.toEqual([{ id: "loc-1", name: "Garage" }]);
     await expect(client.createLocation("token", { name: "Shelf", parentId: "loc-1" })).resolves.toMatchObject({ id: "loc-shelf" });
+  });
+
+  it("normalizes supported aliases for direct item creation", async () => {
+    mock = await startMockHomebox((req, res) => {
+      if (req.method === "POST" && req.path === "/api/v1/entities") {
+        expect(req.body).toEqual({ name: "Drill", parentId: "loc-1", syncChildEntityLocations: true, quantity: 0 });
+        return json(res, 201, { id: "entity-1", ...req.body as object });
+      }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+    const client = new HomeboxClient(mock.url, 5_000, 1024, 1024);
+
+    await expect(client.createItem("token", { name: "Drill", locationId: "loc-1", syncChildItemsLocations: true, quantity: 0 })).resolves.toMatchObject({ parentId: "loc-1", syncChildEntityLocations: true, quantity: 0 });
   });
 
   it("calls v0.26 group, statistics, actions, reporting, barcode and user endpoints", async () => {
@@ -393,6 +412,93 @@ describe("Homebox client", () => {
     const client = new HomeboxClient("http://127.0.0.1", 5_000, 1024, 1024);
     await expect(client.apiRequest("GET", "https://evil.example/api/v1/items", { token: "x" })).rejects.toThrow("Path must be relative");
     await expect(client.apiRequest("GET", "/admin", { token: "x" })).rejects.toThrow("Path must start with /api/v1/");
+    await expect(client.apiRequest("GET", "/api/v1/../../admin", { token: "x" })).rejects.toThrow("Path must start with /api/v1/");
+    await expect(client.apiRequest("GET", "/api/v1/%2e%2e/%2e%2e/admin", { token: "x" })).rejects.toThrow(/encoded/);
+    await expect(client.apiRequest("GET", "/api/v1/..\\..\\admin", { token: "x" })).rejects.toThrow(/backslashes/);
+  });
+
+  it("blocks private external attachment redirects and mapped IPv6 photo targets", async () => {
+    mock = await startMockHomebox((req, res) => {
+      if (req.method === "GET" && req.path === "/api/v1/entities/entity-1/attachments/att-external") {
+        res.statusCode = 302;
+        res.setHeader("location", "http://127.0.0.1:1/private");
+        res.end();
+        return;
+      }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+    const client = new HomeboxClient(mock.url, 5_000, 1024, 1024);
+
+    await expect(client.downloadAttachment("token", "entity-1", "att-external")).rejects.toThrow(/private|loopback/);
+    expect(() => publicHttpUrl("http://[::ffff:7f00:1]/photo.jpg")).toThrow(/private|loopback/);
+    expect(() => publicHttpUrl("http://[64:ff9b::7f00:1]/photo.jpg")).toThrow(/private|loopback/);
+    expect(() => publicHttpUrl("http://[2002:7f00:1::]/photo.jpg")).toThrow(/private|loopback/);
+    expect(() => publicHttpUrl("http://[fec0::1]/photo.jpg")).toThrow(/private|loopback/);
+    expect(() => publicHttpUrl("http://[4000::1]/photo.jpg")).toThrow(/private|loopback/);
+    expect(() => publicHttpUrl("http://[100:0:0:1::1]/photo.jpg")).toThrow(/private|loopback/);
+    expect(publicHttpUrl("https://[2606:4700:4700::1111]/photo.jpg").hostname).toContain("2606:4700");
+  });
+
+  it("keeps the timeout active while reading a successful response body", async () => {
+    mock = await startMockHomebox((req, res) => {
+      if (req.method === "GET" && req.path === "/api/v1/status") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.write('{"ok":');
+        return;
+      }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+    const client = new HomeboxClient(mock.url, 30, 1024, 1024);
+
+    await expect(client.status()).rejects.toThrow(/timed out/);
+  });
+
+  it("confines local photo reads to an opt-in root and validates size and magic bytes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "homebox-mcp-photos-"));
+    const outside = mkdtempSync(join(tmpdir(), "homebox-mcp-private-"));
+    tempDirs.push(root, outside);
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    writeFileSync(join(root, "photo.png"), png);
+    writeFileSync(join(root, "not-image.jpg"), "oauth-store-secret");
+    writeFileSync(join(outside, "secret.png"), png);
+
+    const disabled = new HomeboxClient("http://127.0.0.1", 5_000, 1024, 1024);
+    await expect(disabled.readLocalPhotoFile(join(root, "photo.png"))).rejects.toThrow(/disabled/);
+
+    const client = new HomeboxClient("http://127.0.0.1", 5_000, 1024, 1024, root);
+    await expect(client.readLocalPhotoFile("photo.png")).resolves.toMatchObject({ contentType: "image/png", contentLength: 8, base64: png.toString("base64") });
+    await expect(client.readLocalPhotoFile(join(outside, "secret.png"))).rejects.toThrow(/beneath/);
+    await expect(client.readLocalPhotoFile("not-image.jpg", undefined, "image/jpeg")).rejects.toThrow(/recognized image/);
+
+    const limited = new HomeboxClient("http://127.0.0.1", 5_000, 4, 1024, root);
+    await expect(limited.readLocalPhotoFile("photo.png")).rejects.toThrow(/MAX_UPLOAD_BYTES/);
+    expect(() => client.validateBase64Photo(Buffer.from("not-an-image").toString("base64"), "photo.jpg", "image/jpeg")).toThrow(/recognized JPEG/);
+  });
+
+  it("paginates locations and GET-merges safe location updates", async () => {
+    mock = await startMockHomebox((req, res) => {
+      if (req.method === "GET" && req.path === "/api/v1/entities" && req.query.get("isLocation") === "true") {
+        const page = Number(req.query.get("page"));
+        return json(res, 200, page === 1
+          ? { page: 1, pageSize: 500, total: 501, items: Array.from({ length: 500 }, (_, index) => ({ id: `loc-${index}`, name: `Location ${index}` })) }
+          : { page: 2, pageSize: 500, total: 501, items: [{ id: "loc-500", name: "Location 500" }] });
+      }
+      if (req.method === "GET" && req.path === "/api/v1/entities/loc-1") {
+        return json(res, 200, { id: "loc-1", name: "Old", parent: { id: "parent-1" }, tags: [{ id: "tag-1" }], fields: [{ id: "field-1", name: "Keep", type: "text", textValue: "yes" }] });
+      }
+      if (req.method === "PUT" && req.path === "/api/v1/entities/loc-1") {
+        expect(req.body).toMatchObject({ id: "loc-1", name: "New", parentId: "parent-1", tagIds: ["tag-1"], fields: [{ id: "field-1", name: "Keep", type: "text", textValue: "yes" }] });
+        return json(res, 200, req.body);
+      }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+    const client = new HomeboxClient(mock.url, 5_000, 1024, 1024);
+
+    const locations = await client.listLocations("token") as { total: number; items: Array<{ id: string }> };
+    expect(locations.total).toBe(501);
+    expect(locations.items).toHaveLength(501);
+    expect(locations.items.at(-1)).toMatchObject({ id: "loc-500" });
+    await expect(client.updateLocation("token", "loc-1", { name: "New" })).resolves.toMatchObject({ name: "New", parentId: "parent-1" });
   });
 
   it("pure merge helper preserves fields by name", () => {
@@ -404,6 +510,12 @@ describe("Homebox client", () => {
       { name: "Keep", textValue: "old" },
       { name: "Replace", textValue: "new" },
     ]);
+
+    expect(
+      mergeEntityForPut({ ...currentEntity(), fields: [{ id: "field-1", name: "Replace", type: "text", textValue: "old" }] }, {
+        fields: [{ id: "field-conflict", name: "replace", type: "text", textValue: "new" }],
+      }).fields,
+    ).toEqual([{ id: "field-1", name: "replace", type: "text", textValue: "new" }]);
   });
 });
 

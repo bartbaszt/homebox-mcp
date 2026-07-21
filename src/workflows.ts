@@ -7,8 +7,6 @@
 // (at your option) any later version.
 
 import { createHash } from "node:crypto";
-import { readFile as readFileFs, stat as statFs } from "node:fs/promises";
-import { extname, basename } from "node:path";
 
 import type { HomeboxClient, JsonObject, PublicUrlFile } from "./homebox-client.js";
 import { mergeEntityForPut } from "./homebox-client.js";
@@ -317,28 +315,17 @@ function splitCreatePayload(payload: JsonObject): { core: JsonObject; extra: Jso
   return { core, extra };
 }
 
-const MIME_BY_EXT: Record<string, string> = {
-  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-  ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
-};
-
 async function resolveFileSource(input: PhotoUploadInput, client: HomeboxClient): Promise<{ source: "url" | "base64" | "file"; url?: string; fileName: string; contentType?: string; base64: string; contentLength?: number }> {
   if (input.imageUrl) {
     const file = await client.fetchPublicUrlFile(input.imageUrl, input.fileName, input.contentType);
     return { source: "url", url: file.url, fileName: file.fileName, contentType: file.contentType, base64: file.base64, contentLength: file.contentLength };
   }
   if (input.filePath) {
-    const pathStat = await statFs(input.filePath);
-    if (!pathStat.isFile()) throw new HomeboxMcpError("validation", `filePath is not a regular file: ${input.filePath}`);
-    const buf = await readFileFs(input.filePath);
-    const fileName = input.fileName ?? basename(input.filePath);
-    const ext = extname(input.filePath).toLowerCase();
-    const contentType = input.contentType ?? MIME_BY_EXT[ext];
-    if (!contentType || !contentType.startsWith("image/")) throw new HomeboxMcpError("validation", `filePath has unrecognized image extension "${ext}". Pass contentType explicitly (image/jpeg, image/png, image/webp).`);
-    return { source: "file", fileName, contentType, base64: buf.toString("base64"), contentLength: buf.length };
+    const file = await client.readLocalPhotoFile(input.filePath, input.fileName, input.contentType);
+    return { source: "file", ...file };
   }
   if (input.base64 && input.fileName) {
-    return { source: "base64", fileName: input.fileName, contentType: input.contentType, base64: input.base64 };
+    return { source: "base64", ...client.validateBase64Photo(input.base64, input.fileName, input.contentType) };
   }
   throw new HomeboxMcpError("validation", "Provide imageUrl, filePath (local file), or base64 with fileName.");
 }
@@ -351,8 +338,29 @@ export async function uploadPrimaryPhoto(client: HomeboxClient, token: string, i
 
   const resolved = await resolveFileSource(input, client);
   assertImage(resolved);
-  const attachment = await client.uploadAttachment({ token, itemId: input.itemId, fileName: resolved.fileName, base64: resolved.base64, contentType: resolved.contentType, primary: true });
+  const uploadResponse = await client.uploadAttachment({ token, itemId: input.itemId, fileName: resolved.fileName, base64: resolved.base64, contentType: resolved.contentType, primary: true });
+  const attachment = await resolveUploadedAttachment(client, token, input.itemId, attachments, uploadResponse, resolved.fileName);
   return { itemId: input.itemId, primary: true, source: resolved.source, url: resolved.url, fileName: resolved.fileName, contentType: resolved.contentType, contentLength: resolved.contentLength, attachment, warnings };
+}
+
+async function resolveUploadedAttachment(client: HomeboxClient, token: string, itemId: string, before: JsonObject[], uploadResponse: unknown, fileName: string): Promise<unknown> {
+  const beforeIds = new Set(before.map(readId).filter((id): id is string => Boolean(id)));
+  const responseRecord = toRecord(uploadResponse);
+  const responseAttachments = asRecords(responseRecord);
+  const fromResponse = responseAttachments.find((attachment) => !beforeIds.has(readId(attachment) ?? "") && readString(attachment.title) === fileName)
+    ?? responseAttachments.find((attachment) => !beforeIds.has(readId(attachment) ?? ""));
+  if (fromResponse) return fromResponse;
+
+  const directId = readId(responseRecord);
+  if (directId && directId !== itemId && (responseRecord?.primary !== undefined || responseRecord?.mimeType !== undefined || responseRecord?.type !== undefined)) {
+    return uploadResponse;
+  }
+
+  const current = asRecords(await client.listAttachments(token, itemId));
+  const fromList = current.find((attachment) => !beforeIds.has(readId(attachment) ?? "") && readString(attachment.title) === fileName)
+    ?? current.find((attachment) => !beforeIds.has(readId(attachment) ?? ""));
+  if (!fromList) throw new HomeboxMcpError("homebox", "Homebox accepted the upload but did not expose the new attachment");
+  return fromList;
 }
 
 export async function replacePrimaryPhoto(client: HomeboxClient, token: string, input: ReplacePrimaryPhotoInput): Promise<ReplacePrimaryPhotoResult> {
@@ -423,7 +431,8 @@ export async function ensurePrimaryPhoto(client: HomeboxClient, token: string, i
     return { itemId: input.itemId, primary: true, source: "existing", url: resolvedFile.url, fileName: resolvedFile.fileName, contentType: resolvedFile.contentType, contentLength: resolvedFile.contentLength, attachment: resultAttachment, warnings, reused: true, primaryAttachmentId };
   }
 
-  const attachment = await client.uploadAttachment({ token, itemId: input.itemId, fileName: resolvedFile.fileName, base64: resolvedFile.base64, contentType: resolvedFile.contentType, primary: true });
+  const uploadResponse = await client.uploadAttachment({ token, itemId: input.itemId, fileName: resolvedFile.fileName, base64: resolvedFile.base64, contentType: resolvedFile.contentType, primary: true });
+  const attachment = await resolveUploadedAttachment(client, token, input.itemId, attachments, uploadResponse, resolvedFile.fileName);
   resultAttachment = attachment;
   primaryAttachmentId = readId(toRecord(attachment));
   if (input.cleanupDuplicates) await cleanupDuplicatePhotos(client, token, { itemId: input.itemId });
@@ -452,23 +461,22 @@ export async function cleanupDuplicatePhotos(client: HomeboxClient, token: strin
     if (list.length < 2) continue;
     duplicateGroups += 1;
     const primaryIds = photos.filter((p) => isPrimaryAttachment(p)).map(readId).filter((id): id is string => Boolean(id));
-    const sorted = [...list].sort((a, b) => {
+    const sorted = keepPrimary ? [...list].sort((a, b) => {
       const aPrimary = primaryIds.includes(a.id ?? "");
       const bPrimary = primaryIds.includes(b.id ?? "");
       if (aPrimary && !bPrimary) return -1;
       if (!aPrimary && bPrimary) return 1;
       return 0;
-    });
-    const keeper = sorted[0];
-    for (const entry of sorted.slice(keepPrimary ? 1 : 0)) {
+    }) : [...list];
+    for (const entry of sorted.slice(1)) {
       if (!entry.id) continue;
-      if (keepPrimary && primaryIds.includes(entry.id) && entry.id === keeper.id) continue;
       await client.deleteAttachment(token, input.itemId, entry.id);
       deletedAttachmentIds.push(entry.id);
     }
   }
   if (duplicateGroups > 0) warnings.push(`found ${duplicateGroups} duplicate photo group(s); deleted ${deletedAttachmentIds.length} duplicate attachment(s)`);
-  const keptPrimary = photos.find(isPrimaryAttachment);
+  const remaining = deletedAttachmentIds.length > 0 ? asRecords(await client.listAttachments(token, input.itemId)) : attachments;
+  const keptPrimary = remaining.find(isPrimaryAttachment);
   const keptPrimaryAttachmentId = keptPrimary ? readId(keptPrimary) : undefined;
 
   return { itemId: input.itemId, keptPrimaryAttachmentId, deletedAttachmentIds, duplicateGroups, warnings };
@@ -552,28 +560,16 @@ async function findExistingItem(client: HomeboxClient, token: string, input: Ite
   for (const matchedBy of dedupeBy) {
     const value = dedupeValue(input, matchedBy);
     if (!value) continue;
-    const response = await client.listItems(token, { pageSize: 100, query: { q: value } });
-    const match = asRecords(response).find((item) => itemMatches(item, matchedBy, value));
+    const response = matchedBy === "name"
+      ? await client.listItems(token, { pageSize: 100, query: { q: value } })
+      : await client.listEntities(token, { pageSize: 2, isLocation: false, includeArchived: true, fields: [`${externalFieldName(matchedBy)}=${value}`] });
+    const matches = asRecords(response).filter((item) => matchedBy !== "name" || key(readName(item)) === key(value));
+    if (matches.length > 1) throw new HomeboxMcpError("validation", `Multiple entities match ${externalFieldName(matchedBy)} '${value}'. Resolve duplicates before upserting.`);
+    const match = matches[0];
     const itemId = match ? readId(match) : undefined;
     if (match && itemId) return { itemId, item: match, matchedBy };
   }
   return undefined;
-}
-
-function itemMatches(item: JsonObject, keyName: DedupeKey, expected: string): boolean {
-  if (keyName === "name") return key(readName(item)) === key(expected);
-  return fieldValues(item).some((field) => key(field.name) === key(externalFieldName(keyName)) && key(field.value) === key(expected));
-}
-
-function fieldValues(item: JsonObject): Array<{ name: string; value: string }> {
-  if (!Array.isArray(item.fields)) return [];
-  return item.fields.flatMap((field) => {
-    const record = toRecord(field);
-    if (!record) return [];
-    const name = readString(record.name) ?? readString(record.fieldName);
-    const value = readString(record.textValue) ?? readString(record.value) ?? readString(record.numberValue) ?? readString(record.boolValue);
-    return name && value ? [{ name, value }] : [];
-  });
 }
 
 function workflowFields(input: ItemWorkflowInput): JsonObject[] {
@@ -627,7 +623,7 @@ function externalFieldName(keyName: DedupeKey): string {
   return "Name";
 }
 
-const IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp", "image/tiff"]);
+const IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 function assertImage(file: { contentType?: string; fileName?: string }): void {
   const ct = file.contentType?.toLowerCase().split(";")[0].trim();
@@ -635,7 +631,7 @@ function assertImage(file: { contentType?: string; fileName?: string }): void {
   if (ct === "text/html" || ct === "application/xhtml+xml") {
     throw new HomeboxMcpError("validation", `photoUrl is not a direct image URL; got ${ct}. The URL must point to an image file (image/jpeg, image/png, image/webp), not a product page. Store product page URLs in sourceUrls/notes instead.`);
   }
-  if (!IMAGE_CONTENT_TYPES.has(ct) && !ct.startsWith("image/")) {
+  if (!IMAGE_CONTENT_TYPES.has(ct)) {
     throw new HomeboxMcpError("validation", `photoUrl returned unsupported Content-Type ${ct}. Must be image/jpeg, image/png or image/webp.`);
   }
 }
@@ -655,8 +651,8 @@ function sha256Hex(base64: string): string {
 }
 
 function sameParent(location: JsonObject, parentId?: string): boolean {
-  if (!parentId) return true;
-  return readString(location.parentId) === parentId || readString(toRecord(location.parent)?.id) === parentId;
+  const actualParentId = readString(location.parentId) ?? readString(toRecord(location.parent)?.id);
+  return parentId ? actualParentId === parentId : !actualParentId;
 }
 
 function splitLocationPath(value: string): string[] {

@@ -160,8 +160,14 @@ async function call(client: Client, name: string, args: Record<string, unknown>)
   return result.structuredContent ?? {};
 }
 
-function asArray(value: Record<string, unknown>): unknown[] {
-  return Array.isArray(value.data) ? value.data : Array.isArray(value) ? value : [];
+function asArray(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if (Array.isArray(record.data)) return record.data;
+    if (Array.isArray(record.items)) return record.items;
+  }
+  throw new Error("Expected an array or an object containing data/items array");
 }
 
 function parseTestAccess(filePath: string): TestAccess {
