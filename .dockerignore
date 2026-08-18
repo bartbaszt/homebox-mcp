@@ -6,5 +6,10 @@ coverage/
 .env
 .env.*
 .test-access
+data/
+oauth-store.json
+*.pem
+*.key
+*.crt
 *.log
 *.tsbuildinfo

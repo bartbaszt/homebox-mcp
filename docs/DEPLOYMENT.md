@@ -24,6 +24,7 @@ name: homebox-mcp
 
 services:
   homebox-mcp:
+    # Pin an exact release (e.g. 0.1.0) for reproducible deploys. See "CI Image Registry" below.
     image: ghcr.io/bartbaszt/homebox-mcp:latest
     restart: unless-stopped
     init: true
@@ -95,13 +96,7 @@ HOMEBOX_MCP_MAX_UPLOAD_BYTES=10485760
 HOMEBOX_MCP_MAX_DOWNLOAD_BYTES=10485760
 ```
 
-Log in to GHCR (required because the repo is private):
-
-```bash
-echo YOUR_GITHUB_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
-```
-
-The PAT needs `read:packages` and `repo` scopes.
+The image is public, so no `docker login` is needed.
 
 Start:
 
@@ -248,12 +243,13 @@ HOMEBOX_MCP_TLS_CERT=/certs/homebox-mcp.crt
 
 ## Updates
 
-After a new CI build (push to `master`):
+After a new release (or a new `master` build when tracking `edge`):
 
 ```bash
 docker compose pull
 docker compose up -d
 docker compose logs -f homebox-mcp
+curl -s http://127.0.0.1:3101/health   # confirm the reported version
 ```
 
 Clean up old images:
@@ -264,7 +260,27 @@ docker image prune
 
 ## CI Image Registry
 
-GitHub Actions (`.github/workflows/docker.yml`) builds and pushes the image to `ghcr.io/bartbaszt/homebox-mcp` on every push to `master`. Tags: `latest` + commit SHA.
+GitHub Actions (`.github/workflows/docker.yml`) builds and pushes public images to `ghcr.io/bartbaszt/homebox-mcp`. No registry login is required to pull.
+
+| Tag | Built from | Notes |
+|---|---|---|
+| `X.Y.Z` | git tag `vX.Y.Z` | immutable, recommended for production |
+| `X.Y` | git tag `vX.Y.Z` | moves forward on patch releases only |
+| `latest` | newest git tag `vX.Y.Z` | releases only, never unreleased `master` |
+| `edge` | every push to `master` | unreleased, may break |
+| `sha-<commit>` | every build | pin for debugging |
+
+Versioning is SemVer. Pre-1.0 a minor bump (`0.1.x` to `0.2.0`) may change configuration or tool contracts, so `X.Y` is the safest floating tag. Release tags must match `package.json`; CI fails the build otherwise.
+
+The deployed build is reported as `version` by `GET /health`, baked into the image through the `APP_VERSION` build argument and the `org.opencontainers.image.version` label.
+
+Release flow:
+
+```bash
+npm version minor        # or patch; creates the commit and the vX.Y.Z tag
+git push --follow-tags
+gh release create vX.Y.Z --title vX.Y.Z --notes-file <(sed -n '/## \[X.Y.Z\]/,/## \[/p' CHANGELOG.md)
+```
 
 ## Security Notes
 

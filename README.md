@@ -52,16 +52,27 @@ Authorization: Bearer <HOMEBOX_MCP_API_TOKEN>
 
 ## Docker Compose Deployment
 
-Pre-built images are published to GitHub Container Registry via CI. On the target host:
+Pre-built public images are on GitHub Container Registry, no login required. On the target host:
 
 ```bash
 mkdir -p /srv/homebox-mcp && cd /srv/homebox-mcp
 # create compose.yml and .env (see docs/DEPLOYMENT.md for templates)
-docker login ghcr.io -u <github-user> --password-stdin <<< "<pat-with-read:packages>"
 docker compose pull
 docker compose up -d
 docker compose logs -f homebox-mcp
 ```
+
+Image: `ghcr.io/bartbaszt/homebox-mcp`
+
+| Tag | Points to | Use for |
+|---|---|---|
+| `0.1.0` | one immutable release | production, reproducible deploys |
+| `0.1` | newest patch in that minor line | production with automatic patches |
+| `latest` | newest release | casual deploys |
+| `edge` | current `master` | testing unreleased changes |
+| `sha-<commit>` | one commit | debugging |
+
+Pre-1.0 a minor bump may break configuration, so `0.1` only tracks patches. The running version is reported by `GET /health` and in the MCP `serverInfo`.
 
 Healthcheck:
 
