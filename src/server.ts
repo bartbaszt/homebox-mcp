@@ -7,10 +7,12 @@
 // (at your option) any later version.
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { isIP } from "node:net";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -59,6 +61,28 @@ const SSE_SESSION_MAX_LIFETIME_MS = 60 * 60_000;
 /** How often an open SSE stream verifies that its OAuth grant still exists. */
 const SSE_GRANT_RECHECK_MS = 60_000;
 
+/**
+ * Single source of truth for the reported build version.
+ *
+ * `APP_VERSION` is baked into the container image by CI so a running deployment can be matched to a
+ * release tag. Outside Docker it falls back to `package.json`, which sits one level above both
+ * `src/server.ts` and the flat `dist/server.js` build output.
+ */
+function resolveServerVersion(): string {
+  const fromEnv = process.env.APP_VERSION?.trim();
+  if (fromEnv) return fromEnv;
+  try {
+    const pkgPath = fileURLToPath(new URL("../package.json", import.meta.url));
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: unknown };
+    if (typeof pkg.version === "string" && pkg.version.trim()) return pkg.version.trim();
+  } catch {
+    // Fall through to the development placeholder.
+  }
+  return "0.0.0-dev";
+}
+
+export const SERVER_VERSION = resolveServerVersion();
+
 export function createRuntime(config = loadConfig()): RuntimeState {
   const oauth = oauthConfig(config);
   const state: RuntimeState = {
@@ -79,7 +103,7 @@ export function createRuntime(config = loadConfig()): RuntimeState {
 
 export function createMcpServer(state: RuntimeState, connectionSession?: ConnectionSessionRef): McpServer {
   const server = new McpServer(
-    { name: "homebox-mcp", version: "0.1.0" },
+    { name: "homebox-mcp", version: SERVER_VERSION },
     {
       instructions:
         "Use the OAuth-authorized MCP connection by default. If OAuth is not configured, use homebox_login and pass sessionKey to later tools. This server targets one configured Homebox instance. Collections are Homebox groups.",
@@ -105,6 +129,7 @@ export function createHttpApp(state: RuntimeState): express.Express {
     res.json({
       ok: true,
       name: "homebox-mcp",
+      version: SERVER_VERSION,
       transport: ["streamable-http", "sse"],
       mcpPath: state.config.mcpPath,
       homeboxConfigured: true,
