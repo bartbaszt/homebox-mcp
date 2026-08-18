@@ -25,6 +25,7 @@ Coverage:
 - Workflow payload mapping accepts `purchaseTime` as an alias and emits Homebox `purchaseDate`; direct `purchaseDate` is also accepted.
 - MCP endpoint API-token enforcement.
 - Fail-closed startup for non-local listeners without MCP auth and rejection of placeholder API tokens.
+- Mandatory stable OAuth resource identifier: `HOMEBOX_MCP_PUBLIC_URL` enforced for non-loopback, proxied and direct-HTTPS setups, and its path checked against `HOMEBOX_MCP_PATH`.
 - ChatGPT-style OAuth DCR + PKCE connection flow.
 - OAuth-authenticated tool calls without `homebox_login` or `sessionKey`.
 - Rejection of tool-level `sessionKey` override on OAuth-authenticated MCP connections.

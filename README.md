@@ -97,7 +97,9 @@ $env:HOMEBOX_MCP_DATA_DIR = "C:\homebox-mcp-data" # persist OAuth clients/tokens
 npm start
 ```
 
-Production OAuth requires HTTPS. Set `HOMEBOX_MCP_PUBLIC_URL` to the exact public `/mcp` URL so ChatGPT sends the same `resource` value during authorization and token exchange. Use `HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP=true` only for local tests.
+`HOMEBOX_MCP_PUBLIC_URL` is mandatory when OAuth is enabled and must point at the exact public MCP endpoint, including the `HOMEBOX_MCP_PATH` path (`/mcp` by default). OAuth access tokens are bound to that URL as their `resource` identifier; without it the identifier would be derived from the request `Host` header, which changes behind a reverse proxy or across DNS aliases and silently invalidates issued tokens. A startup error is raised if the value is missing or if its path does not match `HOMEBOX_MCP_PATH`.
+
+The only exception is local development: the public URL may be omitted when `HOMEBOX_MCP_HOST` is loopback, `HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP=true` and `HOMEBOX_MCP_TRUST_PROXY` is unset. Production OAuth requires HTTPS.
 
 The MCP server then exposes:
 

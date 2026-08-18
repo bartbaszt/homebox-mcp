@@ -139,6 +139,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 export function validateConfigSecurity(config: AppConfig): void {
   config.homeboxBaseUrl = normalizeHomeboxUrl(config.homeboxBaseUrl);
   if (config.oauth?.enabled) validateOAuthUrls(config.oauth);
+  validateOAuthResourceBinding(config);
   if (config.apiToken && isPlaceholderToken(config.apiToken)) {
     throw new HomeboxMcpError("config", "HOMEBOX_MCP_API_TOKEN must be changed from the example placeholder value");
   }
@@ -146,6 +147,42 @@ export function validateConfigSecurity(config: AppConfig): void {
     throw new HomeboxMcpError("config", "Refusing to listen on a non-local host without HOMEBOX_MCP_API_TOKEN or HOMEBOX_MCP_OAUTH_ENABLED=true");
   }
   validateLocalFileRoot(config);
+}
+
+/**
+ * OAuth access tokens are bound to a fixed `resource` identifier. Without an explicit public URL
+ * that identifier is derived from the request Host, which is unstable behind a reverse proxy or
+ * with multiple DNS aliases and silently invalidates issued tokens.
+ */
+function validateOAuthResourceBinding(config: AppConfig): void {
+  const oauth = config.oauth;
+  if (!oauth?.enabled) return;
+
+  if (!oauth.publicUrl) {
+    if (isDerivedResourceAllowed(config)) return;
+    throw new HomeboxMcpError(
+      "config",
+      "HOMEBOX_MCP_PUBLIC_URL is required when OAuth is enabled. Without it the OAuth resource identifier is derived from the request Host, which breaks behind a reverse proxy or with multiple hostnames. Local development may omit it only when HOMEBOX_MCP_HOST is loopback, HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP=true and HOMEBOX_MCP_TRUST_PROXY is unset.",
+    );
+  }
+
+  const publicPath = normalizePathname(new URL(oauth.publicUrl).pathname);
+  if (publicPath !== normalizePathname(config.mcpPath)) {
+    throw new HomeboxMcpError(
+      "config",
+      `HOMEBOX_MCP_PUBLIC_URL path must match HOMEBOX_MCP_PATH (${config.mcpPath}); got '${publicPath}'. The public URL must point at the MCP endpoint itself, for example https://mcp.example.com${config.mcpPath}`,
+    );
+  }
+}
+
+/** Loopback-only development listeners may derive the resource identifier from the request. */
+function isDerivedResourceAllowed(config: AppConfig): boolean {
+  return isLocalListenHost(config.host) && Boolean(config.oauth?.allowInsecureHttp) && !config.trustProxy;
+}
+
+function normalizePathname(value: string): string {
+  const trimmed = value.replace(/\/+$/, "");
+  return trimmed || "/";
 }
 
 function validateOAuthUrls(oauth: OAuthConfig): void {

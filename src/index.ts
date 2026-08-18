@@ -15,6 +15,9 @@ startServer()
     if (!started.state.config.apiToken && !started.state.config.oauth?.enabled) {
       console.error("WARNING: HOMEBOX_MCP_API_TOKEN is not set. Do not expose this server externally without it.");
     }
+    if (started.state.config.oauth?.enabled && !started.state.config.oauth.publicUrl) {
+      console.error("WARNING: HOMEBOX_MCP_PUBLIC_URL is not set. The OAuth resource identifier is derived from the request Host, which only works for local development.");
+    }
 
     let shutdownPromise: Promise<void> | undefined;
     const shutdown = (signal: NodeJS.Signals): void => {

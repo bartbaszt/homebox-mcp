@@ -71,6 +71,7 @@ HOMEBOX_MCP_API_TOKEN=replace-with-a-long-random-token
 
 # Optional: enable ChatGPT-compatible OAuth
 # HOMEBOX_MCP_OAUTH_ENABLED=true
+# Required with OAuth; the path must match HOMEBOX_MCP_PATH.
 # HOMEBOX_MCP_PUBLIC_URL=https://mcp.example.com/mcp
 # HOMEBOX_MCP_OAUTH_ISSUER=https://mcp.example.com
 # HOMEBOX_MCP_TRUST_PROXY=127.0.0.1,::1
@@ -203,7 +204,11 @@ Then call `homebox_login` with Homebox credentials and use the returned `session
 
 ## OAuth Details
 
-OAuth requires HTTPS. Set `HOMEBOX_MCP_PUBLIC_URL` to the exact public MCP endpoint URL including the `/mcp` path — the token is bound to this `resource` value.
+OAuth requires HTTPS. `HOMEBOX_MCP_PUBLIC_URL` is required whenever `HOMEBOX_MCP_OAUTH_ENABLED=true` and must be the exact public MCP endpoint URL including the `HOMEBOX_MCP_PATH` path (`/mcp` by default) — access tokens are bound to this value as their `resource` identifier.
+
+The server refuses to start when the public URL is missing or when its path does not match `HOMEBOX_MCP_PATH`. Deriving the identifier from the request `Host` header is only permitted for loopback development (`HOMEBOX_MCP_HOST` loopback, `HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP=true`, `HOMEBOX_MCP_TRUST_PROXY` unset), because a reverse proxy, tunnel or extra DNS alias changes the derived value and invalidates already issued tokens.
+
+Upgrade note: deployments that previously set only the origin (for example `https://mcp.example.com`) must append the MCP path. The `resource` identifier changes with it, so connectors have to be re-authorized once.
 
 Set `HOMEBOX_MCP_DATA_DIR=/data` and mount a private writable volume at `/data` so OAuth dynamic client registrations, access tokens, refresh tokens and mapped Homebox sessions survive container restarts. The persisted file is `oauth-store.json` and contains Homebox tokens; do not share or commit it.
 

@@ -207,10 +207,6 @@ export async function startServer(config = loadConfig()): Promise<StartedServer>
   const state = createRuntime(config);
   const app = createHttpApp(state);
   const tls = loadTlsConfig(config);
-  const oauth = oauthConfig(config);
-  if (oauth.enabled && !oauth.publicUrl && !oauth.allowInsecureHttp && !tls) {
-    throw new HomeboxMcpError("config", "HOMEBOX_MCP_PUBLIC_URL is required for OAuth unless direct HTTPS or HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP=true is configured");
-  }
   const server = tls ? createHttpsServer(tls, app) : createHttpServer(app);
 
   const listenHost = config.host.replace(/^\[|\]$/g, "");

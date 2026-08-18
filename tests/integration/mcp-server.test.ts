@@ -7,7 +7,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { loadConfig, type AppConfig } from "../../src/config.js";
+import { loadConfig, validateConfigSecurity, type AppConfig } from "../../src/config.js";
 import { OAuthStore } from "../../src/oauth-store.js";
 import { startServer, type StartedServer } from "../../src/server.js";
 import { SessionStore } from "../../src/session-store.js";
@@ -67,6 +67,21 @@ describe("HTTP MCP server", () => {
         },
       }),
     ).rejects.toThrow(/HOMEBOX_MCP_OAUTH_ISSUER.*HTTPS/);
+  });
+
+  it("requires a stable OAuth resource identifier", async () => {
+    const oauthEnv = { HOMEBOX_BASE_URL: "http://homebox.local", HOMEBOX_MCP_OAUTH_ENABLED: "true", HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP: "true" };
+    expect(() => loadConfig({ ...oauthEnv, HOMEBOX_MCP_HOST: "0.0.0.0" })).toThrow(/HOMEBOX_MCP_PUBLIC_URL is required/);
+    expect(() => loadConfig({ ...oauthEnv, HOMEBOX_MCP_TRUST_PROXY: "127.0.0.1" })).toThrow(/HOMEBOX_MCP_PUBLIC_URL is required/);
+    expect(loadConfig(oauthEnv).oauth?.publicUrl).toBeUndefined();
+
+    expect(() => loadConfig({ ...oauthEnv, HOMEBOX_MCP_PUBLIC_URL: "http://mcp.example.com" })).toThrow(/path must match HOMEBOX_MCP_PATH \(\/mcp\)/);
+    expect(() => loadConfig({ ...oauthEnv, HOMEBOX_MCP_PUBLIC_URL: "http://mcp.example.com/mcp", HOMEBOX_MCP_PATH: "/custom" })).toThrow(/path must match HOMEBOX_MCP_PATH \(\/custom\)/);
+    expect(loadConfig({ ...oauthEnv, HOMEBOX_MCP_PUBLIC_URL: "http://mcp.example.com/custom/", HOMEBOX_MCP_PATH: "/custom" }).oauth?.publicUrl).toBe("http://mcp.example.com/custom");
+
+    const directHttps: AppConfig = { ...oauthTestConfig("http://127.0.0.1:1"), host: "0.0.0.0", tlsKeyPath: "/tmp/key.pem", tlsCertPath: "/tmp/cert.pem" };
+    expect(() => validateConfigSecurity(directHttps)).toThrow(/HOMEBOX_MCP_PUBLIC_URL is required/);
+    await expect(startServer({ ...oauthTestConfig("http://127.0.0.1:1"), host: "0.0.0.0" })).rejects.toThrow(/HOMEBOX_MCP_PUBLIC_URL is required/);
   });
 
   it("restricts local file roots from sensitive paths and filesystem roots", () => {
