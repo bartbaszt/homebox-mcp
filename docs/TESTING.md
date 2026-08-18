@@ -29,7 +29,7 @@ Coverage:
 - OAuth-authenticated tool calls without `homebox_login` or `sessionKey`.
 - Rejection of tool-level `sessionKey` override on OAuth-authenticated MCP connections.
 - OAuth client/token persistence across server restarts when `HOMEBOX_MCP_DATA_DIR` is configured.
-- Atomic refresh token consumption to prevent refresh token replay.
+- Atomic refresh token rotation: replay protection, rejection of concurrent rotations, rollback and retryable `503` on transient Homebox failures, grant revocation on Homebox `401`, and expiry of abandoned rotation locks.
 - Tool calls through Streamable HTTP client.
 - Tool-contract discovery checks for strict v0.26 create/patch schemas and destructive annotations.
 - Runtime rejection of unsupported create fields, unsupported PATCH fields and empty PATCH mutations before any Homebox request.

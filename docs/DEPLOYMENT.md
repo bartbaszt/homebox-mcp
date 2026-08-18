@@ -218,6 +218,8 @@ Endpoints exposed when OAuth is enabled:
 - `POST /oauth/authorize` — submit credentials, returns auth code
 - `POST /oauth/token` — exchange auth code or refresh token
 
+`POST /oauth/token` with `grant_type=refresh_token` answers `503 temporarily_unavailable` plus `Retry-After` when Homebox is unreachable or fails with a 5xx. The refresh token is preserved in that case, so the client must retry instead of re-running the authorization flow. `400 invalid_grant` means the grant is gone for good and the connection has to be re-authorized.
+
 Do not set `HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP=true` in production.
 
 ## Direct HTTPS in Container

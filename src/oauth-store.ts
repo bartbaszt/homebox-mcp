@@ -21,6 +21,8 @@ const DEFAULT_MAX_RECORDS = 10_000;
 const MAX_STORE_BYTES = 16 * 1024 * 1024;
 const MAX_GRANTS_PER_ACCOUNT = 32;
 const MAX_TOKEN_RECORDS_PER_ACCOUNT = 128;
+/** In-flight refresh rotations older than this are treated as abandoned (crashed request/process). */
+const ROTATION_LOCK_TTL_MS = 60_000;
 
 export interface OAuthStoreOptions {
   authCodeTtlSeconds: number;
@@ -91,6 +93,16 @@ export interface RefreshTokenRecord {
   expiresAt: number;
 }
 
+/** Opaque handle for an in-flight refresh-token rotation. */
+export interface RefreshRotationHandle {
+  readonly key: string;
+}
+
+export interface RefreshRotation {
+  readonly record: RefreshTokenRecord;
+  readonly handle: RefreshRotationHandle;
+}
+
 export class OAuthError extends Error {
   constructor(
     readonly error: string,
@@ -106,6 +118,8 @@ export class OAuthStore {
   private readonly authorizationCodes = new Map<string, AuthorizationCode>();
   private readonly accessTokens = new Map<string, AccessTokenRecord>();
   private readonly refreshTokens = new Map<string, RefreshTokenRecord>();
+  /** Refresh-token hashes with a rotation in flight, mapped to their start time. Never persisted. */
+  private readonly rotations = new Map<string, number>();
   private readonly maxClients: number;
   private readonly maxRecords: number;
 
@@ -232,35 +246,50 @@ export class OAuthStore {
     return stored;
   }
 
-  issueTokens(input: { clientId: string; resource: string; session: HomeboxSession; scope?: string }): TokenPair {
+  /**
+   * Issues a new access/refresh pair.
+   *
+   * When `options.replaces` is provided the rotated refresh token is removed in the same
+   * synchronous mutation, so a rotation either fully succeeds or leaves the old token usable.
+   */
+  issueTokens(
+    input: { clientId: string; resource: string; session: HomeboxSession; scope?: string },
+    options?: { replaces?: RefreshRotationHandle },
+  ): TokenPair {
     const accessToken = `access_${randomSecret(32)}`;
     const refreshToken = `refresh_${randomSecret(32)}`;
     const now = Date.now();
     this.pruneExpired(now);
-    const account = sessionAccountKey(input.session);
-    const accountTokenCount = [...this.accessTokens.values(), ...this.refreshTokens.values()].filter((record) => sessionAccountKey(record.session) === account).length;
-    if (accountTokenCount + 2 > MAX_TOKEN_RECORDS_PER_ACCOUNT) {
-      throw new OAuthError("temporarily_unavailable", "OAuth token capacity reached for this Homebox account", 503);
-    }
-    if (this.accessTokens.size >= this.maxRecords || this.refreshTokens.size >= this.maxRecords) {
-      throw new OAuthError("temporarily_unavailable", "OAuth token capacity reached", 503);
-    }
     const accessKey = hashSecret(accessToken);
     const refreshKey = hashSecret(refreshToken);
-    this.accessTokens.set(accessKey, {
-      ...input,
-      expiresAt: now + this.options.accessTokenTtlSeconds * 1000,
-    });
-    this.refreshTokens.set(refreshKey, {
-      ...input,
-      expiresAt: now + this.options.refreshTokenTtlSeconds * 1000,
-    });
+    const replacedKey = options?.replaces?.key;
+    const replacedRecord = replacedKey ? this.refreshTokens.get(replacedKey) : undefined;
+    if (replacedKey) this.refreshTokens.delete(replacedKey);
     try {
+      const account = sessionAccountKey(input.session);
+      const accountTokenCount = [...this.accessTokens.values(), ...this.refreshTokens.values()].filter((record) => sessionAccountKey(record.session) === account).length;
+      if (accountTokenCount + 2 > MAX_TOKEN_RECORDS_PER_ACCOUNT) {
+        throw new OAuthError("temporarily_unavailable", "OAuth token capacity reached for this Homebox account", 503);
+      }
+      if (this.accessTokens.size >= this.maxRecords || this.refreshTokens.size >= this.maxRecords) {
+        throw new OAuthError("temporarily_unavailable", "OAuth token capacity reached", 503);
+      }
+      this.accessTokens.set(accessKey, {
+        ...input,
+        expiresAt: now + this.options.accessTokenTtlSeconds * 1000,
+      });
+      this.refreshTokens.set(refreshKey, {
+        ...input,
+        expiresAt: now + this.options.refreshTokenTtlSeconds * 1000,
+      });
       this.persist();
     } catch (error) {
       this.accessTokens.delete(accessKey);
       this.refreshTokens.delete(refreshKey);
+      if (replacedKey && replacedRecord) this.refreshTokens.set(replacedKey, replacedRecord);
       throw error;
+    } finally {
+      if (replacedKey) this.rotations.delete(replacedKey);
     }
     return { accessToken, refreshToken, expiresIn: this.options.accessTokenTtlSeconds, scope: input.scope };
   }
@@ -278,26 +307,67 @@ export class OAuthStore {
     return record.session;
   }
 
-  consumeRefreshToken(input: { clientId?: string; refreshToken?: string; resource?: string }): RefreshTokenRecord {
+  /**
+   * Validates a refresh token and locks it for rotation without deleting it.
+   *
+   * The token is only removed when `issueTokens(..., { replaces })` commits, so a failed
+   * Homebox refresh (timeout, network error, 5xx) leaves the OAuth connection usable.
+   * Replay during the in-flight window is rejected by the rotation lock.
+   */
+  beginRefreshTokenRotation(input: { clientId?: string; refreshToken?: string; resource?: string }): RefreshRotation {
     const refreshToken = required(input.refreshToken, "refresh_token");
     const key = hashSecret(refreshToken);
     const record = this.refreshTokens.get(key);
     if (!record) throw new OAuthError("invalid_grant", "Unknown refresh token");
-    if (record.expiresAt <= Date.now()) {
+    const now = Date.now();
+    if (record.expiresAt <= now) {
       this.refreshTokens.delete(key);
+      this.rotations.delete(key);
       this.persist();
       throw new OAuthError("invalid_grant", "Refresh token expired");
     }
     if (record.clientId !== required(input.clientId, "client_id")) throw new OAuthError("invalid_grant", "client_id mismatch");
     if (input.resource && record.resource !== input.resource) throw new OAuthError("invalid_target", "resource mismatch");
-    this.refreshTokens.delete(key);
+    const startedAt = this.rotations.get(key);
+    if (startedAt !== undefined && startedAt + ROTATION_LOCK_TTL_MS > now) {
+      throw new OAuthError("invalid_grant", "Refresh token rotation is already in progress");
+    }
+    this.rotations.set(key, now);
+    return { record, handle: { key } };
+  }
+
+  /**
+   * Releases a rotation lock without rotating.
+   * With `revokeGrant` the whole grant is dropped, for when Homebox rejected the session itself.
+   */
+  abortRefreshTokenRotation(handle: RefreshRotationHandle, options?: { revokeGrant?: boolean }): void {
+    this.rotations.delete(handle.key);
+    if (!options?.revokeGrant) return;
+    const record = this.refreshTokens.get(handle.key);
+    this.refreshTokens.delete(handle.key);
+    if (record) this.revokeSessionTokens(record.session.sessionKey);
     this.persist();
-    return record;
+  }
+
+  /** Idempotent rotation-lock release, safe to call from a `finally` block. */
+  releaseRotation(handle: RefreshRotationHandle): void {
+    this.rotations.delete(handle.key);
+  }
+
+  /** Single-shot validate-and-delete. Prefer `beginRefreshTokenRotation` when a network call follows. */
+  consumeRefreshToken(input: { clientId?: string; refreshToken?: string; resource?: string }): RefreshTokenRecord {
+    const rotation = this.beginRefreshTokenRotation(input);
+    this.rotations.delete(rotation.handle.key);
+    this.refreshTokens.delete(rotation.handle.key);
+    this.persist();
+    return rotation.record;
   }
 
   revokeRefreshToken(refreshToken: string | undefined): void {
     if (!refreshToken) return;
-    if (this.refreshTokens.delete(hashSecret(refreshToken))) this.persist();
+    const key = hashSecret(refreshToken);
+    this.rotations.delete(key);
+    if (this.refreshTokens.delete(key)) this.persist();
   }
 
   private loadPersisted(): void {
@@ -351,7 +421,25 @@ export class OAuthStore {
     pruneMap(this.authorizationCodes, now);
     pruneMap(this.accessTokens, now);
     pruneMap(this.refreshTokens, now);
+    this.pruneRotations(now);
     this.pruneUnusedClients(now);
+  }
+
+  private pruneRotations(now: number): void {
+    for (const [key, startedAt] of this.rotations) {
+      if (startedAt + ROTATION_LOCK_TTL_MS <= now || !this.refreshTokens.has(key)) this.rotations.delete(key);
+    }
+  }
+
+  private revokeSessionTokens(sessionKey: string): void {
+    for (const [key, record] of this.authorizationCodes) if (record.session.sessionKey === sessionKey) this.authorizationCodes.delete(key);
+    for (const [key, record] of this.accessTokens) if (record.session.sessionKey === sessionKey) this.accessTokens.delete(key);
+    for (const [key, record] of this.refreshTokens) {
+      if (record.session.sessionKey === sessionKey) {
+        this.refreshTokens.delete(key);
+        this.rotations.delete(key);
+      }
+    }
   }
 
   private pruneUnusedClients(now: number): void {

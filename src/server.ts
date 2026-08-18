@@ -377,27 +377,38 @@ function registerOAuthRoutes(app: express.Express, state: RuntimeState): void {
         const refreshToken = formValue(req.body, "refresh_token");
         const resource = formValue(req.body, "resource");
         if (resource) assertExpectedResource(resource, resourceUrl(req, state.config));
-        const refresh = state.oauth.consumeRefreshToken({
+        const rotation = state.oauth.beginRefreshTokenRotation({
           clientId: formValue(req.body, "client_id"),
           refreshToken,
           resource,
         });
-        const refreshed = await state.homebox.refresh(refresh.session.token);
-        sendTokenResponse(
-          res,
-          state.oauth.issueTokens({
-            clientId: refresh.clientId,
-            resource: refresh.resource,
-            scope: refresh.scope,
-            session: {
-              ...refresh.session,
-              token: refreshed.token,
-              expiresAt: refreshed.expiresAt,
-              attachmentToken: refreshed.attachmentToken ?? refresh.session.attachmentToken,
-              refreshedAt: new Date().toISOString(),
-            },
-          }),
-        );
+        const refresh = rotation.record;
+        try {
+          const refreshed = await state.homebox.refresh(refresh.session.token);
+          sendTokenResponse(
+            res,
+            state.oauth.issueTokens(
+              {
+                clientId: refresh.clientId,
+                resource: refresh.resource,
+                scope: refresh.scope,
+                session: {
+                  ...refresh.session,
+                  token: refreshed.token,
+                  expiresAt: refreshed.expiresAt,
+                  attachmentToken: refreshed.attachmentToken ?? refresh.session.attachmentToken,
+                  refreshedAt: new Date().toISOString(),
+                },
+              },
+              { replaces: rotation.handle },
+            ),
+          );
+        } catch (error) {
+          state.oauth.abortRefreshTokenRotation(rotation.handle, { revokeGrant: isDeadHomeboxSession(error) });
+          throw refreshFailureToOAuthError(error);
+        } finally {
+          state.oauth.releaseRotation(rotation.handle);
+        }
         return;
       }
 
@@ -535,10 +546,31 @@ function sendTokenResponse(res: Response, tokens: { accessToken: string; refresh
 
 function sendOAuthError(res: Response, error: unknown): void {
   if (error instanceof OAuthError) {
+    if (error.status === 503) res.setHeader("Retry-After", "5");
     res.status(error.status).json({ error: error.error, error_description: error.message });
     return;
   }
   res.status(500).json({ error: "server_error", error_description: "OAuth request failed" });
+}
+
+/** True when Homebox itself rejected the mapped session, so the grant can never be refreshed again. */
+function isDeadHomeboxSession(error: unknown): boolean {
+  return error instanceof HomeboxMcpError && error.kind === "auth";
+}
+
+/**
+ * Maps a Homebox refresh failure onto an OAuth error.
+ * Transient failures stay retryable (503) because the refresh token survives the failed rotation.
+ */
+function refreshFailureToOAuthError(error: unknown): OAuthError {
+  if (error instanceof OAuthError) return error;
+  if (error instanceof HomeboxMcpError) {
+    if (error.kind === "auth") return new OAuthError("invalid_grant", "Homebox session is no longer valid. Re-authorize the connection.");
+    if (error.kind === "network" || (error.kind === "homebox" && (error.status ?? 500) >= 500)) {
+      return new OAuthError("temporarily_unavailable", "Homebox could not refresh the session right now. Retry shortly.", 503);
+    }
+  }
+  return new OAuthError("server_error", "Refresh token rotation failed", 500);
 }
 
 function setNoStore(res: Response): void {

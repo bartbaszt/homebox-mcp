@@ -5,7 +5,7 @@ import { join, parse } from "node:path";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { loadConfig, type AppConfig } from "../../src/config.js";
 import { OAuthStore } from "../../src/oauth-store.js";
@@ -388,6 +388,125 @@ describe("HTTP MCP server", () => {
     expect(() => store.consumeRefreshToken({ clientId: "client-1", refreshToken: tokens.refreshToken })).toThrow(/Unknown refresh token/);
   });
 
+  it("keeps the OAuth connection usable when the Homebox refresh fails transiently", async () => {
+    let refreshAttempts = 0;
+    mock = await startMockHomebox((req, res) => {
+      if (req.method === "POST" && req.path === "/api/v1/users/login") {
+        json(res, 200, { token: "Bearer oauth-homebox-token", expiresAt: "2030-01-01T00:00:00Z" });
+        return;
+      }
+      if (req.method === "GET" && req.path === "/api/v1/users/refresh") {
+        refreshAttempts += 1;
+        json(res, refreshAttempts === 1 ? 502 : 200, refreshAttempts === 1 ? { error: "upstream unavailable" } : { token: "Bearer refreshed-token", expiresAt: "2031-01-01T00:00:00Z" });
+        return;
+      }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+    started = await startServer(oauthTestConfig(mock.url));
+    const origin = new URL(started.url).origin;
+    const resource = started.url;
+    const grant = await createOAuthGrant(origin, resource, "transient refresh test");
+
+    const failed = await refreshGrant(origin, resource, grant.clientId, grant.refreshToken);
+    expect(failed.status).toBe(503);
+    expect(failed.headers.get("retry-after")).toBe("5");
+    await expect(failed.json()).resolves.toMatchObject({ error: "temporarily_unavailable" });
+    expect(started.state.oauth.validateAccessToken(grant.accessToken, resource)?.token).toBe("Bearer oauth-homebox-token");
+
+    const retried = await refreshGrant(origin, resource, grant.clientId, grant.refreshToken);
+    expect(retried.status).toBe(200);
+    const rotated = (await retried.json()) as { access_token: string; refresh_token: string };
+    expect(refreshAttempts).toBe(2);
+    expect(started.state.oauth.validateAccessToken(rotated.access_token, resource)?.token).toBe("Bearer refreshed-token");
+
+    const replayed = await refreshGrant(origin, resource, grant.clientId, grant.refreshToken);
+    expect(replayed.status).toBe(400);
+    await expect(replayed.json()).resolves.toMatchObject({ error: "invalid_grant" });
+  });
+
+  it("revokes the grant when Homebox rejects the refreshed session", async () => {
+    mock = await startMockHomebox((req, res) => {
+      if (req.method === "POST" && req.path === "/api/v1/users/login") {
+        json(res, 200, { token: "Bearer oauth-homebox-token", expiresAt: "2030-01-01T00:00:00Z" });
+        return;
+      }
+      if (req.method === "GET" && req.path === "/api/v1/users/refresh") {
+        json(res, 401, { error: "unauthorized" });
+        return;
+      }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+    started = await startServer(oauthTestConfig(mock.url));
+    const origin = new URL(started.url).origin;
+    const resource = started.url;
+    const grant = await createOAuthGrant(origin, resource, "dead session refresh test");
+
+    const rejected = await refreshGrant(origin, resource, grant.clientId, grant.refreshToken);
+    expect(rejected.status).toBe(400);
+    await expect(rejected.json()).resolves.toMatchObject({ error: "invalid_grant" });
+    expect(started.state.oauth.validateAccessToken(grant.accessToken, resource)).toBeUndefined();
+
+    const retried = await refreshGrant(origin, resource, grant.clientId, grant.refreshToken);
+    expect(retried.status).toBe(400);
+  });
+
+  it("rejects concurrent rotations of the same refresh token", async () => {
+    mock = await startMockHomebox(async (req, res) => {
+      if (req.method === "POST" && req.path === "/api/v1/users/login") {
+        json(res, 200, { token: "Bearer oauth-homebox-token", expiresAt: "2030-01-01T00:00:00Z" });
+        return;
+      }
+      if (req.method === "GET" && req.path === "/api/v1/users/refresh") {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        json(res, 200, { token: "Bearer refreshed-token", expiresAt: "2031-01-01T00:00:00Z" });
+        return;
+      }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+    started = await startServer(oauthTestConfig(mock.url));
+    const origin = new URL(started.url).origin;
+    const resource = started.url;
+    const grant = await createOAuthGrant(origin, resource, "concurrent refresh test");
+
+    const responses = await Promise.all([
+      refreshGrant(origin, resource, grant.clientId, grant.refreshToken),
+      refreshGrant(origin, resource, grant.clientId, grant.refreshToken),
+    ]);
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 400]);
+    const rejected = responses.find((response) => response.status === 400);
+    await expect(rejected?.json()).resolves.toMatchObject({ error: "invalid_grant", error_description: expect.stringContaining("rotation is already in progress") });
+  });
+
+  it("restores the refresh token when issuing the rotated pair fails", () => {
+    const store = new OAuthStore({ authCodeTtlSeconds: 300, accessTokenTtlSeconds: 3600, refreshTokenTtlSeconds: 3600, maxRecords: 1 });
+    const resource = "https://mcp.example.com/mcp";
+    const session = { sessionKey: "oauth:grant-1", token: "Bearer homebox-token", createdAt: new Date().toISOString() };
+    const tokens = store.issueTokens({ clientId: "client-1", resource, session });
+
+    const rotation = store.beginRefreshTokenRotation({ clientId: "client-1", refreshToken: tokens.refreshToken });
+    expect(() => store.issueTokens({ clientId: "client-1", resource, session }, { replaces: rotation.handle })).toThrow(/token capacity/);
+    expect(store.consumeRefreshToken({ clientId: "client-1", refreshToken: tokens.refreshToken }).clientId).toBe("client-1");
+  });
+
+  it("expires abandoned refresh-token rotation locks", () => {
+    vi.useFakeTimers();
+    try {
+      const store = new OAuthStore({ authCodeTtlSeconds: 300, accessTokenTtlSeconds: 3600, refreshTokenTtlSeconds: 3600 });
+      const tokens = store.issueTokens({
+        clientId: "client-1",
+        resource: "https://mcp.example.com/mcp",
+        session: { sessionKey: "oauth:grant-1", token: "Bearer homebox-token", createdAt: new Date().toISOString() },
+      });
+
+      store.beginRefreshTokenRotation({ clientId: "client-1", refreshToken: tokens.refreshToken });
+      expect(() => store.beginRefreshTokenRotation({ clientId: "client-1", refreshToken: tokens.refreshToken })).toThrow(/already in progress/);
+      vi.setSystemTime(new Date(Date.now() + 61_000));
+      expect(store.beginRefreshTokenRotation({ clientId: "client-1", refreshToken: tokens.refreshToken }).record.clientId).toBe("client-1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("bounds dynamic OAuth client registration metadata and storage", () => {
     const store = new OAuthStore({ authCodeTtlSeconds: 300, accessTokenTtlSeconds: 3600, refreshTokenTtlSeconds: 3600, maxClients: 1 });
     const redirects = Array.from({ length: 11 }, (_, index) => `https://client.example.com/callback/${index}`);
@@ -559,6 +678,58 @@ describe("HTTP MCP server", () => {
     ).rejects.toThrow(/HOMEBOX_MCP_PUBLIC_URL/);
   });
 });
+
+const PKCE_VERIFIER = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012345678901234567890123456789";
+
+async function createOAuthGrant(origin: string, resource: string, clientName: string): Promise<{ clientId: string; accessToken: string; refreshToken: string }> {
+  const redirectUri = "http://127.0.0.1/callback";
+  const registration = await fetch(`${origin}/oauth/register`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_name: clientName, redirect_uris: [redirectUri], token_endpoint_auth_method: "none" }),
+  });
+  const registered = (await registration.json()) as { client_id: string };
+
+  const authorize = await fetch(`${origin}/oauth/authorize`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      response_type: "code",
+      client_id: registered.client_id,
+      redirect_uri: redirectUri,
+      code_challenge: createHash("sha256").update(PKCE_VERIFIER).digest("base64url"),
+      code_challenge_method: "S256",
+      resource,
+      username: "user@example.com",
+      password: "secret",
+    }),
+  });
+  const callback = new URL(authorize.headers.get("location") ?? "");
+
+  const tokenResponse = await fetch(`${origin}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: registered.client_id,
+      redirect_uri: redirectUri,
+      code: callback.searchParams.get("code") ?? "",
+      code_verifier: PKCE_VERIFIER,
+      resource,
+    }),
+  });
+  const tokens = (await tokenResponse.json()) as { access_token: string; refresh_token: string };
+  return { clientId: registered.client_id, accessToken: tokens.access_token, refreshToken: tokens.refresh_token };
+}
+
+function refreshGrant(origin: string, resource: string, clientId: string, refreshToken: string): Promise<Response> {
+  return fetch(`${origin}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, refresh_token: refreshToken, resource }),
+  });
+}
 
 function testConfig(homeboxBaseUrl: string, apiToken?: string): AppConfig {
   return {

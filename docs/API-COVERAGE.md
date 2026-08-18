@@ -13,7 +13,7 @@ Targets **Homebox v0.26.x** (Entity Merge API). The legacy `/v1/items/*` and `/v
 
 When `HOMEBOX_MCP_DATA_DIR` is configured, OAuth dynamic client registrations, authorization codes, access tokens, refresh tokens and mapped Homebox sessions are persisted to `oauth-store.json` in that directory. Raw OAuth token strings are not stored, only their hashes; mapped Homebox sessions still contain Homebox tokens and must be treated as secrets.
 
-OAuth refresh tokens are single-use. `consumeRefreshToken` removes the old refresh token before Homebox token refresh, so concurrent refresh attempts cannot replay the same token.
+OAuth refresh tokens are single-use, but rotation is committed only after Homebox actually returns a refreshed session. `beginRefreshTokenRotation` locks the token while the Homebox call is in flight, so a concurrent request with the same refresh token is rejected with `invalid_grant`; the old token is deleted in the same atomic mutation that stores the new pair. If the Homebox refresh fails transiently (timeout, network error, Homebox 5xx) the old refresh token stays valid and `POST /oauth/token` answers `503 temporarily_unavailable` with `Retry-After`, so the connector can simply retry. If Homebox rejects the session itself (401/403) the whole grant is revoked and the response is `400 invalid_grant`, which requires re-authorization.
 
 When an MCP request is authenticated by OAuth, tool-level `sessionKey` and raw Homebox `token` inputs are rejected; the connection's OAuth session is used instead.
 
