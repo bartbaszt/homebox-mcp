@@ -20,6 +20,16 @@ export interface HomeboxSession {
   refreshedAt?: string;
 }
 
+/**
+ * Mutable holder for the Homebox session of an MCP connection.
+ *
+ * Long-lived transports (SSE) must not capture the session by value: the OAuth grant can rotate
+ * its Homebox token while the stream stays open, and tool calls have to follow the current token.
+ */
+export interface ConnectionSessionRef {
+  current: HomeboxSession;
+}
+
 export interface PublicSessionInfo {
   sessionKey: string;
   username?: string;

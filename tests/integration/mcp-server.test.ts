@@ -11,7 +11,7 @@ import { loadConfig, validateConfigSecurity, type AppConfig } from "../../src/co
 import { OAuthStore } from "../../src/oauth-store.js";
 import { startServer, type StartedServer } from "../../src/server.js";
 import { SessionStore } from "../../src/session-store.js";
-import { json, startMockHomebox, type MockHomeboxServer } from "../support/mock-homebox.js";
+import { json, startMockHomebox, type MockHomeboxRequest, type MockHomeboxServer } from "../support/mock-homebox.js";
 
 let mock: MockHomeboxServer | undefined;
 let started: StartedServer | undefined;
@@ -391,6 +391,135 @@ describe("HTTP MCP server", () => {
     await reader!.cancel();
   });
 
+  it("follows refresh-token rotation on an open SSE session", async () => {
+    mock = await startMockHomebox((req, res) => {
+      if (req.method === "POST" && req.path === "/api/v1/users/login") {
+        json(res, 200, { token: "Bearer sse-token", expiresAt: "2030-01-01T00:00:00Z" });
+        return;
+      }
+      if (req.method === "GET" && req.path === "/api/v1/users/refresh") {
+        json(res, 200, { token: "Bearer sse-rotated-token", expiresAt: "2031-01-01T00:00:00Z" });
+        return;
+      }
+      if (req.method === "GET" && req.path === "/api/v1/entities") {
+        json(res, 200, { page: 1, pageSize: 1, total: 1, items: [{ id: "entity-1", name: "Drill" }] });
+        return;
+      }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+    started = await startServer(oauthTestConfig(mock.url));
+    const origin = new URL(started.url).origin;
+    const resource = started.url;
+    const grant = await createOAuthGrant(origin, resource, "sse rotation test");
+
+    const sse = await fetch(`${origin}/mcp/sse`, { headers: { authorization: `Bearer ${grant.accessToken}` } });
+    expect(sse.status).toBe(200);
+    const reader = sse.body!.getReader();
+    const endpoint = /data: ([^\r\n]+)/.exec(new TextDecoder().decode((await reader.read()).value))?.[1];
+    if (!endpoint) throw new Error("SSE endpoint event was not received");
+
+    await postSseMessage(origin, endpoint, grant.accessToken, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "sse-rotation-test", version: "0.1.0" } },
+    });
+    await postSseMessage(origin, endpoint, grant.accessToken, { jsonrpc: "2.0", method: "notifications/initialized" });
+    await postSseMessage(origin, endpoint, grant.accessToken, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "homebox_list_items", arguments: { pageSize: 1 } },
+    });
+    expect((await waitForEntityRequests(mock, 1)).at(-1)?.headers.authorization).toBe("Bearer sse-token");
+
+    const rotated = await refreshGrant(origin, resource, grant.clientId, grant.refreshToken);
+    expect(rotated.status).toBe(200);
+    const rotatedTokens = (await rotated.json()) as { access_token: string };
+
+    await postSseMessage(origin, endpoint, rotatedTokens.access_token, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "homebox_list_items", arguments: { pageSize: 1 } },
+    });
+    expect((await waitForEntityRequests(mock, 2)).at(-1)?.headers.authorization).toBe("Bearer sse-rotated-token");
+
+    await reader.cancel();
+  });
+
+  it("closes an open SSE stream once the OAuth grant is revoked", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const config = oauthTestConfig("http://127.0.0.1:1");
+      config.oauth = { ...config.oauth!, publicUrl: "http://mcp.example.test/mcp" };
+      started = await startServer(config);
+      const origin = new URL(started.url).origin;
+      const tokens = started.state.oauth.issueTokens({
+        clientId: "client-1",
+        resource: config.oauth.publicUrl!,
+        session: { sessionKey: "oauth:grant-1", token: "Bearer first", createdAt: new Date().toISOString() },
+      });
+
+      const sse = await fetch(`${origin}/mcp/sse`, { headers: { authorization: `Bearer ${tokens.accessToken}` } });
+      expect(sse.status).toBe(200);
+      const reader = sse.body!.getReader();
+      await reader.read();
+
+      expect(started.state.oauth.hasActiveGrant("oauth:grant-1")).toBe(true);
+      started.state.oauth.revokeGrant("oauth:grant-1");
+      expect(started.state.oauth.hasActiveGrant("oauth:grant-1")).toBe(false);
+      expect(started.state.oauth.validateAccessToken(tokens.accessToken, config.oauth.publicUrl!)).toBeUndefined();
+
+      vi.advanceTimersByTime(60_000);
+      expect((await reader.read()).done).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a grant active while only a refresh token remains", () => {
+    const store = new OAuthStore({ authCodeTtlSeconds: 300, accessTokenTtlSeconds: 3600, refreshTokenTtlSeconds: 3600 });
+    const resource = "https://mcp.example.com/mcp";
+    const session = { sessionKey: "oauth:grant-1", token: "Bearer homebox-token", createdAt: new Date().toISOString() };
+    const tokens = store.issueTokens({ clientId: "client-1", resource, session });
+
+    expect(store.hasActiveGrant("oauth:grant-1")).toBe(true);
+    expect(store.hasActiveGrant("oauth:unknown")).toBe(false);
+
+    const rotation = store.beginRefreshTokenRotation({ clientId: "client-1", refreshToken: tokens.refreshToken });
+    store.abortRefreshTokenRotation(rotation.handle, { revokeGrant: true });
+    expect(store.hasActiveGrant("oauth:grant-1")).toBe(false);
+  });
+
+  it("rejects SSE message posts once the access token expires", async () => {
+    const config = oauthTestConfig("http://127.0.0.1:1");
+    config.oauth = { ...config.oauth!, publicUrl: "http://mcp.example.test/mcp", accessTokenTtlSeconds: 1 };
+    started = await startServer(config);
+    const origin = new URL(started.url).origin;
+    const tokens = started.state.oauth.issueTokens({
+      clientId: "client-1",
+      resource: config.oauth.publicUrl!,
+      session: { sessionKey: "oauth:grant-1", token: "Bearer first", createdAt: new Date().toISOString() },
+    });
+
+    const sse = await fetch(`${origin}/mcp/sse`, { headers: { authorization: `Bearer ${tokens.accessToken}` } });
+    expect(sse.status).toBe(200);
+    const reader = sse.body?.getReader();
+    const event = await reader!.read();
+    const endpoint = /data: ([^\r\n]+)/.exec(new TextDecoder().decode(event.value))?.[1];
+    if (!endpoint) throw new Error("SSE endpoint event was not received");
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const expiredPost = await fetch(`${origin}${endpoint}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${tokens.accessToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    expect(expiredPost.status).toBe(401);
+    await reader!.cancel();
+  });
+
   it("consumes OAuth refresh tokens atomically", () => {
     const store = new OAuthStore({ authCodeTtlSeconds: 300, accessTokenTtlSeconds: 3600, refreshTokenTtlSeconds: 3600 });
     const tokens = store.issueTokens({
@@ -736,6 +865,25 @@ async function createOAuthGrant(origin: string, resource: string, clientName: st
   });
   const tokens = (await tokenResponse.json()) as { access_token: string; refresh_token: string };
   return { clientId: registered.client_id, accessToken: tokens.access_token, refreshToken: tokens.refresh_token };
+}
+
+async function postSseMessage(origin: string, endpoint: string, accessToken: string, message: unknown): Promise<void> {
+  const response = await fetch(`${origin}${endpoint}`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+    body: JSON.stringify(message),
+  });
+  expect(response.status).toBe(202);
+  await response.text();
+}
+
+async function waitForEntityRequests(server: MockHomeboxServer, count: number): Promise<MockHomeboxRequest[]> {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const entityRequests = server.requests.filter((request) => request.path === "/api/v1/entities");
+    if (entityRequests.length >= count) return entityRequests;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Mock Homebox did not receive ${count} entity requests`);
 }
 
 function refreshGrant(origin: string, resource: string, clientId: string, refreshToken: string): Promise<Response> {

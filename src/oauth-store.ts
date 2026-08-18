@@ -308,6 +308,23 @@ export class OAuthStore {
   }
 
   /**
+   * True while a grant still has any live token. Used by long-lived transports to notice that the
+   * connection was revoked or expired, instead of trusting the authentication done at stream open.
+   */
+  /** Drops every authorization code and token issued for a grant. */
+  revokeGrant(sessionKey: string): void {
+    this.revokeSessionTokens(sessionKey);
+    this.persist();
+  }
+
+  hasActiveGrant(sessionKey: string): boolean {
+    this.pruneExpired(Date.now());
+    for (const record of this.accessTokens.values()) if (record.session.sessionKey === sessionKey) return true;
+    for (const record of this.refreshTokens.values()) if (record.session.sessionKey === sessionKey) return true;
+    return false;
+  }
+
+  /**
    * Validates a refresh token and locks it for rotation without deleting it.
    *
    * The token is only removed when `issueTokens(..., { replaces })` commits, so a failed
@@ -345,8 +362,8 @@ export class OAuthStore {
     if (!options?.revokeGrant) return;
     const record = this.refreshTokens.get(handle.key);
     this.refreshTokens.delete(handle.key);
-    if (record) this.revokeSessionTokens(record.session.sessionKey);
-    this.persist();
+    if (record) this.revokeGrant(record.session.sessionKey);
+    else this.persist();
   }
 
   /** Idempotent rotation-lock release, safe to call from a `finally` block. */

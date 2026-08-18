@@ -29,6 +29,7 @@ Coverage:
 - ChatGPT-style OAuth DCR + PKCE connection flow.
 - OAuth-authenticated tool calls without `homebox_login` or `sessionKey`.
 - Rejection of tool-level `sessionKey` override on OAuth-authenticated MCP connections.
+- SSE session binding: message posts re-authenticate the bearer token, adopt the rotated Homebox session, and the stream is closed once the OAuth grant is revoked.
 - OAuth client/token persistence across server restarts when `HOMEBOX_MCP_DATA_DIR` is configured.
 - Atomic refresh token rotation: replay protection, rejection of concurrent rotations, rollback and retryable `503` on transient Homebox failures, grant revocation on Homebox `401`, and expiry of abandoned rotation locks.
 - Tool calls through Streamable HTTP client.

@@ -17,6 +17,8 @@ OAuth refresh tokens are single-use, but rotation is committed only after Homebo
 
 When an MCP request is authenticated by OAuth, tool-level `sessionKey` and raw Homebox `token` inputs are rejected; the connection's OAuth session is used instead.
 
+The legacy SSE transport authenticates both the stream (`GET /mcp/sse`) and every message post (`POST /mcp/messages`); an expired or revoked access token is rejected on each post, and the post must belong to the same principal that opened the stream. The Homebox session is held by reference, so a refresh-token rotation is picked up by an already open stream instead of leaving it pinned to the old Homebox token. Open streams are additionally re-checked once a minute and closed when the OAuth grant no longer has any live token.
+
 ## Instance
 
 - `homebox_status`: `GET /api/v1/status`.

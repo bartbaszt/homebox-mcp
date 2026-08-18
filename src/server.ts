@@ -21,7 +21,7 @@ import { type AppConfig, type OAuthConfig, loadConfig, loadTlsConfig, validateCo
 import { HomeboxMcpError } from "./errors.js";
 import { HomeboxClient } from "./homebox-client.js";
 import { OAuthError, OAuthStore } from "./oauth-store.js";
-import type { HomeboxSession } from "./session-store.js";
+import type { ConnectionSessionRef, HomeboxSession } from "./session-store.js";
 import { SessionStore } from "./session-store.js";
 import { registerHomeboxResources, registerHomeboxTools } from "./tools.js";
 
@@ -45,7 +45,9 @@ interface SseSessionEntry {
   transport: SSEServerTransport;
   principal: string;
   account: string;
+  sessionRef?: ConnectionSessionRef;
   lifetimeTimer?: NodeJS.Timeout;
+  grantTimer?: NodeJS.Timeout;
   closing?: Promise<void>;
 }
 
@@ -54,6 +56,8 @@ const MAX_SSE_SESSIONS = 256;
 const MAX_SSE_SESSIONS_PER_PRINCIPAL = 8;
 const MAX_SSE_SESSIONS_PER_ACCOUNT = 16;
 const SSE_SESSION_MAX_LIFETIME_MS = 60 * 60_000;
+/** How often an open SSE stream verifies that its OAuth grant still exists. */
+const SSE_GRANT_RECHECK_MS = 60_000;
 
 export function createRuntime(config = loadConfig()): RuntimeState {
   const oauth = oauthConfig(config);
@@ -73,7 +77,7 @@ export function createRuntime(config = loadConfig()): RuntimeState {
   return state;
 }
 
-export function createMcpServer(state: RuntimeState, connectionSession?: HomeboxSession): McpServer {
+export function createMcpServer(state: RuntimeState, connectionSession?: ConnectionSessionRef): McpServer {
   const server = new McpServer(
     { name: "homebox-mcp", version: "0.1.0" },
     {
@@ -111,7 +115,7 @@ export function createHttpApp(state: RuntimeState): express.Express {
 
   app.all(state.config.mcpPath, requireMcpAuth(state), mcpJsonParser, async (req, res, next) => {
     try {
-      const server = createMcpServer(state, authenticatedSession(req));
+      const server = createMcpServer(state, connectionSessionRef(req));
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => {
         void Promise.allSettled([transport.close(), server.close()]);
@@ -137,14 +141,23 @@ export function createHttpApp(state: RuntimeState): express.Express {
       res.status(429).json({ ok: false, error: "SSE session capacity reached; close an existing session before reconnecting" });
       return;
     }
-    const server = createMcpServer(state, connectionSession);
+    const sessionRef = connectionSession ? { current: connectionSession } : undefined;
+    const server = createMcpServer(state, sessionRef);
     const transport = new SSEServerTransport(sseMessagesPath, res);
-    const entry: SseSessionEntry = { server, transport, principal, account };
+    const entry: SseSessionEntry = { server, transport, principal, account, sessionRef };
     sseTransports.set(transport.sessionId, entry);
     entry.lifetimeTimer = setTimeout(() => {
       void closeSseSession(sseTransports, transport.sessionId, entry).catch(() => undefined);
     }, SSE_SESSION_MAX_LIFETIME_MS);
     entry.lifetimeTimer.unref();
+    if (sessionRef) {
+      // The stream outlives a single access token, so drop it as soon as the whole grant is gone.
+      entry.grantTimer = setInterval(() => {
+        if (state.oauth.hasActiveGrant(sessionRef.current.sessionKey)) return;
+        void closeSseSession(sseTransports, transport.sessionId, entry).catch(() => undefined);
+      }, SSE_GRANT_RECHECK_MS);
+      entry.grantTimer.unref();
+    }
     res.on("close", () => {
       void closeSseSession(sseTransports, transport.sessionId, entry).catch(() => undefined);
     });
@@ -172,6 +185,9 @@ export function createHttpApp(state: RuntimeState): express.Express {
         res.status(403).json({ ok: false, error: "SSE session belongs to a different authenticated principal" });
         return;
       }
+      // Adopt the freshly authenticated session so tool calls follow refresh-token rotation.
+      const currentSession = authenticatedSession(req);
+      if (entry.sessionRef && currentSession) entry.sessionRef.current = currentSession;
       const { transport } = entry;
       await transport.handlePostMessage(req, res, req.body);
     } catch (error) {
@@ -426,6 +442,11 @@ function authenticatedSession(req: Request): HomeboxSession | undefined {
   return (req as AuthenticatedRequest).homeboxSession;
 }
 
+function connectionSessionRef(req: Request): ConnectionSessionRef | undefined {
+  const session = authenticatedSession(req);
+  return session ? { current: session } : undefined;
+}
+
 function authenticatedPrincipal(req: Request): string {
   return (req as AuthenticatedRequest).mcpPrincipal ?? "anonymous";
 }
@@ -678,6 +699,7 @@ function closeSseSession(sessions: Map<string, SseSessionEntry>, sessionId: stri
   if (entry.closing) return entry.closing;
   if (sessions.get(sessionId) === entry) sessions.delete(sessionId);
   if (entry.lifetimeTimer) clearTimeout(entry.lifetimeTimer);
+  if (entry.grantTimer) clearInterval(entry.grantTimer);
   entry.closing = (async () => {
     let failure: unknown;
     try {

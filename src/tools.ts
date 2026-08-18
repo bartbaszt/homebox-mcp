@@ -12,14 +12,14 @@ import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { HomeboxClient, JsonObject, QueryValue } from "./homebox-client.js";
-import type { HomeboxSession, SessionStore } from "./session-store.js";
+import type { ConnectionSessionRef, SessionStore } from "./session-store.js";
 import { HomeboxMcpError, toSafeError } from "./errors.js";
 import { cleanupDuplicatePhotos, createItemFull, ensurePrimaryPhoto, findOrCreateLocation, replacePrimaryPhoto, resolveTags, uploadPrimaryPhoto, upsertItemsBulk, type BulkUpsertInput, type ItemWorkflowInput } from "./workflows.js";
 
 export interface ToolState {
   homebox: HomeboxClient;
   sessions: SessionStore;
-  connectionSession?: HomeboxSession;
+  connectionSession?: ConnectionSessionRef;
 }
 
 const authInput = {
@@ -1911,7 +1911,7 @@ function registerGenericRequestTool(server: McpServer, state: ToolState): void {
 function tokenFrom(args: { sessionKey?: string; token?: string }, state: ToolState): string {
   if (state.connectionSession) {
     if (args.token || args.sessionKey) throw new HomeboxMcpError("auth", "Do not pass token or sessionKey when using MCP OAuth; the OAuth connection session is used automatically.");
-    return state.connectionSession.token;
+    return state.connectionSession.current.token;
   }
   if (args.token) return args.token;
   if (args.sessionKey) return state.sessions.get(args.sessionKey).token;
@@ -1921,7 +1921,7 @@ function tokenFrom(args: { sessionKey?: string; token?: string }, state: ToolSta
 function optionalTokenFrom(args: { sessionKey?: string; token?: string }, state: ToolState): string | undefined {
   if (state.connectionSession) {
     if (args.token || args.sessionKey) throw new HomeboxMcpError("auth", "Do not pass token or sessionKey when using MCP OAuth; the OAuth connection session is used automatically.");
-    return state.connectionSession.token;
+    return state.connectionSession.current.token;
   }
   if (args.token) return args.token;
   if (args.sessionKey) return state.sessions.get(args.sessionKey).token;
@@ -1967,7 +1967,7 @@ export function registerHomeboxResources(server: McpServer, state: ToolState): v
     list: undefined,
     complete: {
       entityId: async (value) => {
-        const token = state.connectionSession?.token;
+        const token = state.connectionSession?.current.token;
         if (!token) return [];
         try {
           const entities = await state.homebox.listEntities(token, { q: value, pageSize: 10 });
@@ -1984,7 +1984,7 @@ export function registerHomeboxResources(server: McpServer, state: ToolState): v
     attachmentTemplate,
     { description: "Download a Homebox entity attachment. Returns image content for images, base64 blob for other file types. Requires OAuth or connection-authenticated session." },
     async (uri, variables) => {
-      const token = state.connectionSession?.token;
+      const token = state.connectionSession?.current.token;
       if (!token) throw new HomeboxMcpError("auth", "No authenticated session for resource read. Use homebox_download_attachment or homebox_download_entity_attachment tool instead.");
       const { entityId, attachmentId } = variables as Record<string, string>;
       const file = await state.homebox.downloadEntityAttachment(token, entityId, attachmentId);
