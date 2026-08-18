@@ -19,6 +19,7 @@ export interface AppConfig {
   mcpPath: string;
   apiToken?: string;
   trustProxy?: string[];
+  allowedOrigins?: string[];
   oauth?: OAuthConfig;
   tlsKeyPath?: string;
   tlsCertPath?: string;
@@ -68,6 +69,42 @@ function readTrustProxy(env: NodeJS.ProcessEnv): string[] | undefined {
   const proxies = raw.split(",").map((value) => value.trim()).filter(Boolean);
   if (proxies.length === 0 || proxies.length > 16) throw new HomeboxMcpError("config", "HOMEBOX_MCP_TRUST_PROXY must list at most 16 trusted proxy addresses or CIDRs");
   return proxies;
+}
+
+const MAX_ALLOWED_ORIGINS = 16;
+
+/**
+ * Browser MCP clients need CORS, but a wildcard would expose the server to any web page,
+ * including the loopback deployments that run without MCP auth. Only exact origins are accepted.
+ */
+function readAllowedOrigins(env: NodeJS.ProcessEnv): string[] | undefined {
+  const raw = env.HOMEBOX_MCP_ALLOWED_ORIGINS?.trim();
+  if (!raw) return undefined;
+  const origins = raw.split(",").map((value) => value.trim()).filter(Boolean);
+  if (origins.length === 0) return undefined;
+  if (origins.length > MAX_ALLOWED_ORIGINS) {
+    throw new HomeboxMcpError("config", `HOMEBOX_MCP_ALLOWED_ORIGINS must list at most ${MAX_ALLOWED_ORIGINS} origins`);
+  }
+  return [...new Set(origins.map((origin) => normalizeOrigin(origin)))];
+}
+
+export function normalizeOrigin(raw: string): string {
+  if (raw === "*") {
+    throw new HomeboxMcpError("config", "HOMEBOX_MCP_ALLOWED_ORIGINS must list exact origins; '*' is not supported because it would expose the MCP endpoint to any web page");
+  }
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new HomeboxMcpError("config", `HOMEBOX_MCP_ALLOWED_ORIGINS entry '${raw}' must be an absolute origin such as https://app.example.com`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new HomeboxMcpError("config", `HOMEBOX_MCP_ALLOWED_ORIGINS entry '${raw}' must use HTTP or HTTPS`);
+  }
+  if (url.username || url.password || url.search || url.hash || (url.pathname !== "" && url.pathname !== "/")) {
+    throw new HomeboxMcpError("config", `HOMEBOX_MCP_ALLOWED_ORIGINS entry '${raw}' must be an origin without credentials, path, query or fragment`);
+  }
+  return url.origin;
 }
 
 function normalizeOptionalUrl(raw: string | undefined, key: string): string | undefined {
@@ -122,6 +159,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     mcpPath,
     apiToken,
     trustProxy: readTrustProxy(env),
+    allowedOrigins: readAllowedOrigins(env),
     oauth,
     tlsKeyPath: env.HOMEBOX_MCP_TLS_KEY?.trim() || undefined,
     tlsCertPath: env.HOMEBOX_MCP_TLS_CERT?.trim() || undefined,
@@ -145,6 +183,12 @@ export function validateConfigSecurity(config: AppConfig): void {
   }
   if (!config.apiToken && !config.oauth?.enabled && !isLocalListenHost(config.host)) {
     throw new HomeboxMcpError("config", "Refusing to listen on a non-local host without HOMEBOX_MCP_API_TOKEN or HOMEBOX_MCP_OAUTH_ENABLED=true");
+  }
+  if (config.allowedOrigins?.length) {
+    config.allowedOrigins = [...new Set(config.allowedOrigins.map((origin) => normalizeOrigin(origin)))];
+    if (!config.apiToken && !config.oauth?.enabled) {
+      throw new HomeboxMcpError("config", "HOMEBOX_MCP_ALLOWED_ORIGINS requires HOMEBOX_MCP_API_TOKEN or HOMEBOX_MCP_OAUTH_ENABLED=true; cross-origin browser access to an unauthenticated MCP endpoint would expose the Homebox instance to any listed web page");
+    }
   }
   validateLocalFileRoot(config);
 }

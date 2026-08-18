@@ -160,6 +160,62 @@ describe("HTTP MCP server", () => {
     expect(oversizedMcp.status).toBe(413);
   });
 
+  it("validates browser origin allowlists", () => {
+    const base = { HOMEBOX_BASE_URL: "http://homebox.local", HOMEBOX_MCP_API_TOKEN: "token-value" };
+    expect(() => loadConfig({ ...base, HOMEBOX_MCP_ALLOWED_ORIGINS: "*" })).toThrow(/exact origins/);
+    expect(() => loadConfig({ ...base, HOMEBOX_MCP_ALLOWED_ORIGINS: "https://app.example.com/path" })).toThrow(/without credentials, path/);
+    expect(() => loadConfig({ ...base, HOMEBOX_MCP_ALLOWED_ORIGINS: "not-a-url" })).toThrow(/absolute origin/);
+    expect(() => loadConfig({ ...base, HOMEBOX_MCP_ALLOWED_ORIGINS: "ws://app.example.com" })).toThrow(/HTTP or HTTPS/);
+    expect(() => loadConfig({ ...base, HOMEBOX_MCP_ALLOWED_ORIGINS: Array.from({ length: 17 }, (_, index) => `https://a${index}.example.com`).join(",") })).toThrow(/at most 16/);
+    expect(() => loadConfig({ HOMEBOX_BASE_URL: "http://homebox.local", HOMEBOX_MCP_ALLOWED_ORIGINS: "https://app.example.com" })).toThrow(/requires HOMEBOX_MCP_API_TOKEN/);
+    expect(loadConfig({ ...base, HOMEBOX_MCP_ALLOWED_ORIGINS: "https://app.example.com:443, https://app.example.com" }).allowedOrigins).toEqual(["https://app.example.com"]);
+  });
+
+  it("emits CORS headers only for allowlisted browser origins", async () => {
+    const config: AppConfig = { ...testConfig("http://127.0.0.1:1", "mcp-secret"), allowedOrigins: ["https://app.example.com"] };
+    started = await startServer(config);
+    const origin = new URL(started.url).origin;
+
+    const preflight = await fetch(started.url, {
+      method: "OPTIONS",
+      headers: { origin: "https://app.example.com", "access-control-request-method": "POST", "access-control-request-headers": "authorization,content-type" },
+    });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get("access-control-allow-origin")).toBe("https://app.example.com");
+    expect(preflight.headers.get("access-control-allow-methods")).toContain("POST");
+    expect(preflight.headers.get("access-control-allow-headers")).toContain("Authorization");
+    expect(preflight.headers.get("access-control-max-age")).toBe("600");
+    expect(preflight.headers.get("vary")).toContain("Origin");
+
+    const foreign = await fetch(started.url, { method: "OPTIONS", headers: { origin: "https://evil.example.com", "access-control-request-method": "POST" } });
+    expect(foreign.headers.get("access-control-allow-origin")).toBeNull();
+    expect(foreign.status).toBe(401);
+
+    const metadata = await fetch(`${origin}/.well-known/oauth-protected-resource`, { headers: { origin: "https://app.example.com" } });
+    expect(metadata.headers.get("access-control-allow-origin")).toBe("https://app.example.com");
+
+    const authorized = await fetch(started.url, {
+      method: "POST",
+      headers: {
+        origin: "https://app.example.com",
+        authorization: "Bearer mcp-secret",
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "cors-test", version: "0.1.0" } } }),
+    });
+    expect(authorized.headers.get("access-control-allow-origin")).toBe("https://app.example.com");
+    expect(authorized.headers.get("access-control-expose-headers")).toContain("WWW-Authenticate");
+    await authorized.body?.cancel();
+  });
+
+  it("sends no CORS headers when no browser origin is allowlisted", async () => {
+    started = await startServer(testConfig("http://127.0.0.1:1", "mcp-secret"));
+    const preflight = await fetch(started.url, { method: "OPTIONS", headers: { origin: "https://app.example.com", "access-control-request-method": "POST" } });
+    expect(preflight.headers.get("access-control-allow-origin")).toBeNull();
+    expect(preflight.status).toBe(401);
+  });
+
   it("does not expose the configured Homebox URL in public health", async () => {
     await expect(startServer(testConfig("http://user:secret@internal.homebox.local"))).rejects.toThrow(/credentials/);
     started = await startServer(testConfig("http://internal.homebox.local"));

@@ -96,6 +96,9 @@ export function createHttpApp(state: RuntimeState): express.Express {
   const bodyLimit = `${Math.ceil(state.config.maxUploadBytes * 1.5)}b`;
   const mcpJsonParser = express.json({ limit: bodyLimit });
 
+  // Registered before every route so CORS preflights are answered without hitting MCP auth.
+  app.use(corsHeaders(state.config));
+
   registerOAuthRoutes(app, state);
 
   app.get("/health", (_req, res) => {
@@ -246,6 +249,50 @@ export async function startServer(config = loadConfig()): Promise<StartedServer>
     url,
     close,
   };
+}
+
+const CORS_ALLOWED_HEADERS = "Authorization, Content-Type, X-Api-Key, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID";
+const CORS_EXPOSED_HEADERS = "Mcp-Session-Id, WWW-Authenticate";
+const CORS_MAX_AGE_SECONDS = 600;
+
+/**
+ * Emits CORS headers for browser MCP clients whose origin is explicitly allowlisted.
+ * Requests from any other origin are left untouched, so the browser keeps blocking them.
+ */
+function corsHeaders(config: AppConfig): RequestHandler {
+  const allowed = new Set(config.allowedOrigins ?? []);
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (allowed.size === 0) {
+      next();
+      return;
+    }
+    res.vary("Origin");
+    const origin = normalizeRequestOrigin(req.header("origin"));
+    if (!origin || !allowed.has(origin)) {
+      next();
+      return;
+    }
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Expose-Headers", CORS_EXPOSED_HEADERS);
+    if (req.method !== "OPTIONS") {
+      next();
+      return;
+    }
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", CORS_ALLOWED_HEADERS);
+    res.setHeader("Access-Control-Max-Age", String(CORS_MAX_AGE_SECONDS));
+    res.status(204).end();
+  };
+}
+
+function normalizeRequestOrigin(raw: string | undefined): string | undefined {
+  const value = raw?.trim();
+  if (!value || value === "null") return undefined;
+  try {
+    return new URL(value).origin;
+  } catch {
+    return undefined;
+  }
 }
 
 function requireMcpAuth(state: RuntimeState) {

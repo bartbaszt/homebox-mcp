@@ -24,6 +24,7 @@ Coverage:
 - Workflow helpers for tag resolution, location creation, full entity creation, bulk upsert, primary photo replacement and public URL validation.
 - Workflow payload mapping accepts `purchaseTime` as an alias and emits Homebox `purchaseDate`; direct `purchaseDate` is also accepted.
 - MCP endpoint API-token enforcement.
+- Browser CORS allowlist: preflight answered before authentication for listed origins, no headers for other origins or when unset, and rejection of `*`, non-origin entries and allowlists without MCP auth.
 - Fail-closed startup for non-local listeners without MCP auth and rejection of placeholder API tokens.
 - Mandatory stable OAuth resource identifier: `HOMEBOX_MCP_PUBLIC_URL` enforced for non-loopback, proxied and direct-HTTPS setups, and its path checked against `HOMEBOX_MCP_PATH`.
 - ChatGPT-style OAuth DCR + PKCE connection flow.

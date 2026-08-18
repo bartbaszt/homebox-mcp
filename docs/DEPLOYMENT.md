@@ -87,6 +87,9 @@ HOMEBOX_MCP_DATA_DIR=/data
 # Never point this at /data or any directory containing credentials.
 # HOMEBOX_MCP_LOCAL_FILE_ROOT=/photos
 
+# Exact browser origins allowed to call /mcp cross-origin. Unset means no CORS headers.
+# HOMEBOX_MCP_ALLOWED_ORIGINS=https://app.example.com
+
 HOMEBOX_API_TIMEOUT_MS=30000
 HOMEBOX_MCP_MAX_UPLOAD_BYTES=10485760
 HOMEBOX_MCP_MAX_DOWNLOAD_BYTES=10485760

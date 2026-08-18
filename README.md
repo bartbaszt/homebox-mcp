@@ -118,6 +118,10 @@ Optional OAuth env:
 - `HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP`: local/test escape hatch; do not use in production.
 - `HOMEBOX_MCP_DATA_DIR`: optional writable directory for `oauth-store.json`. Set this for ChatGPT connectors so OAuth client registrations and tokens survive restarts.
 
+Optional browser clients:
+
+- `HOMEBOX_MCP_ALLOWED_ORIGINS`: comma-separated list of exact browser origins (for example `https://app.example.com`) that may call the MCP endpoint cross-origin. Unset by default, which means no CORS headers are sent and browsers keep blocking cross-origin calls. `*` is rejected; so is any entry with a path, query, fragment or credentials. Setting it requires `HOMEBOX_MCP_API_TOKEN` or OAuth, because cross-origin access to an unauthenticated endpoint would hand the listed pages full control of the Homebox instance. Preflight `OPTIONS` requests are answered before authentication, `Mcp-Session-Id` and `WWW-Authenticate` are exposed to the client.
+
 Optional local photo access:
 
 - `HOMEBOX_MCP_LOCAL_FILE_ROOT`: optional root enabling workflow `filePath` photo uploads. Without it, `filePath` is disabled. Resolved files must remain beneath this root. Never point it at `HOMEBOX_MCP_DATA_DIR` or another directory containing OAuth data or secrets.
