@@ -8,6 +8,10 @@ contain breaking changes to configuration or tool contracts.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-19
+
+Security release. OAuth authorization now requires an explicit, informed consent step.
+
 ### Added
 
 - Opt-in OAuth redirect allowlist through `HOMEBOX_MCP_OAUTH_ALLOWED_REDIRECT_ORIGINS`, enforced at
@@ -72,5 +76,6 @@ releases, `edge` follows `master`.
 - SSRF-safe public URL fetching with per-redirect address validation and hard byte limits.
 - Open SSE streams follow refresh-token rotation and close when the OAuth grant is revoked.
 
-[Unreleased]: https://github.com/bartbaszt/homebox-mcp/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/bartbaszt/homebox-mcp/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/bartbaszt/homebox-mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bartbaszt/homebox-mcp/releases/tag/v0.1.0
