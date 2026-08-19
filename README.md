@@ -94,7 +94,7 @@ In ChatGPT → Settings → Connectors (or MCP Apps):
 | **URL** | `https://mcp.example.com/mcp` |
 | **Auth** | OAuth (auto-discovered via `/.well-known/oauth-protected-resource`) |
 
-On first connection, ChatGPT opens a login form where you enter Homebox credentials once. The password is discarded; ChatGPT stores the OAuth token pair in connector settings. Subsequent tool calls work without `sessionKey`.
+On first connection, ChatGPT opens a consent screen that names the requesting client and the host that will receive the authorization code, and a login form where you enter Homebox credentials once. The password is discarded; ChatGPT stores the OAuth token pair in connector settings. Subsequent tool calls work without `sessionKey`.
 
 ## ChatGPT OAuth
 
@@ -117,12 +117,23 @@ The MCP server then exposes:
 - `GET /.well-known/oauth-protected-resource`
 - `GET /.well-known/oauth-authorization-server`
 - `POST /oauth/register` for dynamic client registration.
-- `GET/POST /oauth/authorize` with a Homebox login form.
+- `GET/POST /oauth/authorize` with a consent screen and Homebox login form.
 - `POST /oauth/token` for authorization-code and refresh-token grants.
+
+### Consent screen
+
+Dynamic client registration is open by default, so any client can register a redirect URI. The consent screen is what keeps that from turning into silent delegated access: before any authorization code is issued it shows the requesting client name (as declared by the client, explicitly marked unverified), the host that will receive the authorization code, the requested scope, the MCP server `resource` and the client ID.
+
+- An authorization code is only issued when the user presses **Authorize**. `POST /oauth/authorize` requires `action=allow`; a request without a decision is answered with the consent screen again, never with a code.
+- **Cancel** sends `action=deny`, which redirects back to the client with `error=access_denied` and does not touch the submitted Homebox credentials.
+- The page is served with `Content-Security-Policy` (`default-src 'none'`, hashed inline stylesheet, `form-action 'self' <redirect-origin>`, `base-uri 'none'`, `frame-ancestors 'none'`), `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
+
+If you receive an `/oauth/authorize` link you did not start from your own client, press Cancel. The only field on that page that this server can verify is the redirect host.
 
 Optional OAuth env:
 
 - `HOMEBOX_MCP_OAUTH_ISSUER`: external issuer origin if different from `HOMEBOX_MCP_PUBLIC_URL` origin.
+- `HOMEBOX_MCP_OAUTH_ALLOWED_REDIRECT_ORIGINS`: comma-separated allowlist of exact OAuth client redirect origins (for example `https://chatgpt.com`), at most 16. Unset means dynamic client registration accepts any HTTPS redirect origin (plus loopback HTTP), which is what browser connectors need out of the box. **Recommended for self-hosted deployments**: setting it blocks registration and authorization for every other origin, which removes the consent-phishing vector entirely instead of relying on the user reading the consent screen. Entries must be bare origins without path, query, fragment or credentials; `*` is rejected. A loopback entry without a port (`http://127.0.0.1`) matches any port, because native clients bind a random loopback port per RFC 8252 section 7.3. The allowlist is enforced both at `POST /oauth/register` and at `/oauth/authorize`, so tightening it also invalidates clients already stored in `oauth-store.json`.
 - `HOMEBOX_MCP_OAUTH_AUTH_CODE_TTL_SECONDS`: authorization code lifetime, default `300`.
 - `HOMEBOX_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS`: access token lifetime, default `3600`.
 - `HOMEBOX_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS`: refresh token lifetime, default `2592000`.
@@ -160,7 +171,7 @@ npm start
 With OAuth-enabled ChatGPT connectors:
 
 1. Connect the ChatGPT app to the public `/mcp` URL.
-2. Complete the OAuth login form with Homebox credentials.
+2. Review the consent screen, then complete the OAuth login form with Homebox credentials and press Authorize.
 3. Call tools directly; `sessionKey` is not required.
 
 With static MCP auth or local agents:

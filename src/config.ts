@@ -38,6 +38,8 @@ export interface OAuthConfig {
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
   allowInsecureHttp: boolean;
+  /** Optional allowlist of OAuth client redirect origins. Unset keeps dynamic registration open. */
+  allowedRedirectOrigins?: string[];
 }
 
 export interface TlsConfig {
@@ -88,23 +90,44 @@ function readAllowedOrigins(env: NodeJS.ProcessEnv): string[] | undefined {
   return [...new Set(origins.map((origin) => normalizeOrigin(origin)))];
 }
 
-export function normalizeOrigin(raw: string): string {
+export function normalizeOrigin(raw: string, key = "HOMEBOX_MCP_ALLOWED_ORIGINS"): string {
   if (raw === "*") {
-    throw new HomeboxMcpError("config", "HOMEBOX_MCP_ALLOWED_ORIGINS must list exact origins; '*' is not supported because it would expose the MCP endpoint to any web page");
+    throw new HomeboxMcpError("config", `${key} must list exact origins; '*' is not supported because it would expose the MCP endpoint to any web page`);
   }
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
-    throw new HomeboxMcpError("config", `HOMEBOX_MCP_ALLOWED_ORIGINS entry '${raw}' must be an absolute origin such as https://app.example.com`);
+    throw new HomeboxMcpError("config", `${key} entry '${raw}' must be an absolute origin such as https://app.example.com`);
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new HomeboxMcpError("config", `HOMEBOX_MCP_ALLOWED_ORIGINS entry '${raw}' must use HTTP or HTTPS`);
+    throw new HomeboxMcpError("config", `${key} entry '${raw}' must use HTTP or HTTPS`);
   }
   if (url.username || url.password || url.search || url.hash || (url.pathname !== "" && url.pathname !== "/")) {
-    throw new HomeboxMcpError("config", `HOMEBOX_MCP_ALLOWED_ORIGINS entry '${raw}' must be an origin without credentials, path, query or fragment`);
+    throw new HomeboxMcpError("config", `${key} entry '${raw}' must be an origin without credentials, path, query or fragment`);
   }
   return url.origin;
+}
+
+const REDIRECT_ORIGINS_KEY = "HOMEBOX_MCP_OAUTH_ALLOWED_REDIRECT_ORIGINS";
+const MAX_ALLOWED_REDIRECT_ORIGINS = 16;
+
+/**
+ * Optional hard limit on which OAuth clients can receive an authorization code.
+ *
+ * Dynamic client registration is open by default so browser connectors work without operator
+ * setup. Restricting the redirect origins is the strongest available defence against consent
+ * phishing on a self-hosted deployment, so it stays available as opt-in configuration.
+ */
+function readAllowedRedirectOrigins(env: NodeJS.ProcessEnv): string[] | undefined {
+  const raw = env[REDIRECT_ORIGINS_KEY]?.trim();
+  if (!raw) return undefined;
+  const origins = raw.split(",").map((value) => value.trim()).filter(Boolean);
+  if (origins.length === 0) return undefined;
+  if (origins.length > MAX_ALLOWED_REDIRECT_ORIGINS) {
+    throw new HomeboxMcpError("config", `${REDIRECT_ORIGINS_KEY} must list at most ${MAX_ALLOWED_REDIRECT_ORIGINS} origins`);
+  }
+  return [...new Set(origins.map((origin) => normalizeOrigin(origin, REDIRECT_ORIGINS_KEY)))];
 }
 
 function normalizeOptionalUrl(raw: string | undefined, key: string): string | undefined {
@@ -147,6 +170,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     accessTokenTtlSeconds: readInt(env, "HOMEBOX_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS", 3600),
     refreshTokenTtlSeconds: readInt(env, "HOMEBOX_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS", 30 * 24 * 60 * 60),
     allowInsecureHttp: readBool(env, "HOMEBOX_MCP_OAUTH_ALLOW_INSECURE_HTTP"),
+    allowedRedirectOrigins: readAllowedRedirectOrigins(env),
   };
   validateOAuthUrls(oauth);
 
@@ -178,6 +202,7 @@ export function validateConfigSecurity(config: AppConfig): void {
   config.homeboxBaseUrl = normalizeHomeboxUrl(config.homeboxBaseUrl);
   if (config.oauth?.enabled) validateOAuthUrls(config.oauth);
   validateOAuthResourceBinding(config);
+  validateAllowedRedirectOrigins(config);
   if (config.apiToken && isPlaceholderToken(config.apiToken)) {
     throw new HomeboxMcpError("config", "HOMEBOX_MCP_API_TOKEN must be changed from the example placeholder value");
   }
@@ -191,6 +216,18 @@ export function validateConfigSecurity(config: AppConfig): void {
     }
   }
   validateLocalFileRoot(config);
+}
+
+function validateAllowedRedirectOrigins(config: AppConfig): void {
+  const origins = config.oauth?.allowedRedirectOrigins;
+  if (!origins?.length) return;
+  if (!config.oauth?.enabled) {
+    throw new HomeboxMcpError("config", `${REDIRECT_ORIGINS_KEY} requires HOMEBOX_MCP_OAUTH_ENABLED=true; it only restricts the OAuth authorization flow`);
+  }
+  if (origins.length > MAX_ALLOWED_REDIRECT_ORIGINS) {
+    throw new HomeboxMcpError("config", `${REDIRECT_ORIGINS_KEY} must list at most ${MAX_ALLOWED_REDIRECT_ORIGINS} origins`);
+  }
+  config.oauth.allowedRedirectOrigins = [...new Set(origins.map((origin) => normalizeOrigin(origin, REDIRECT_ORIGINS_KEY)))];
 }
 
 /**

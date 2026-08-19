@@ -336,6 +336,7 @@ describe("HTTP MCP server", () => {
         code_challenge: challenge,
         code_challenge_method: "S256",
         resource: `${origin}/wrong-resource`,
+        action: "allow",
         username: "user@example.com",
         password: "secret",
       }),
@@ -355,6 +356,7 @@ describe("HTTP MCP server", () => {
         code_challenge_method: "S256",
         resource,
         state: "state-1",
+        action: "allow",
         username: "user@example.com",
         password: "secret",
       }),
@@ -412,6 +414,194 @@ describe("HTTP MCP server", () => {
     expect(rejectedSessionOverride.structuredContent).toMatchObject({ kind: "auth" });
 
     await client.close();
+  });
+
+  it("shows an informed consent screen with hardened headers and escaped client metadata", async () => {
+    started = await startServer(oauthTestConfig("http://127.0.0.1:1"));
+    const origin = new URL(started.url).origin;
+    const redirectUri = "https://attacker.example/callback";
+    const registration = await fetch(`${origin}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name: '<img src=x onerror="alert(1)">Totally ChatGPT', redirect_uris: [redirectUri] }),
+    });
+    const registered = (await registration.json()) as { client_id: string };
+
+    const query = new URLSearchParams({
+      response_type: "code",
+      client_id: registered.client_id,
+      redirect_uri: redirectUri,
+      code_challenge: createHash("sha256").update(PKCE_VERIFIER).digest("base64url"),
+      code_challenge_method: "S256",
+      resource: started.url,
+      state: "state-consent",
+    });
+    const page = await fetch(`${origin}/oauth/authorize?${query.toString()}`);
+    expect(page.status).toBe(200);
+    const html = await page.text();
+
+    // The user must see who is asking, where the code goes and what is being granted.
+    expect(html).toContain("attacker.example");
+    expect(html).toContain(escapedHtml(redirectUri));
+    expect(html).toContain("not verified");
+    expect(html).toContain("Full read and write access");
+    expect(html).toContain('name="action" value="allow"');
+    expect(html).toContain('name="action" value="deny"');
+    // A client-declared name is untrusted input and must never become live markup.
+    expect(html).not.toContain("<img src=x");
+    expect(html).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
+
+    const csp = page.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(csp).toContain("base-uri 'none'");
+    // The declared hash must cover the actual inline stylesheet, otherwise CSP blocks our own CSS.
+    const inlineStyle = /<style>([\s\S]*?)<\/style>/.exec(html)?.[1] ?? "";
+    expect(inlineStyle.length).toBeGreaterThan(0);
+    expect(csp).toContain(`style-src 'sha256-${createHash("sha256").update(inlineStyle).digest("base64")}'`);
+    // The post-submit 302 is cross-origin, so the redirect origin has to be an allowed form target.
+    expect(csp).toContain("form-action 'self' https://attacker.example");
+    expect(page.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(page.headers.get("x-frame-options")).toBe("DENY");
+    expect(page.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(page.headers.get("cache-control")).toContain("no-store");
+  });
+
+  it("declines authorization without using Homebox credentials and refuses implicit consent", async () => {
+    mock = await startMockHomebox((req, res) => {
+      if (req.method === "POST" && req.path === "/api/v1/users/login") {
+        json(res, 200, { token: "Bearer should-never-be-issued", expiresAt: "2030-01-01T00:00:00Z" });
+        return;
+      }
+      json(res, 404, { error: `${req.method} ${req.path}` });
+    });
+    started = await startServer(oauthTestConfig(mock.url));
+    const origin = new URL(started.url).origin;
+    const redirectUri = "http://127.0.0.1/callback";
+    const registration = await fetch(`${origin}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name: "Consent test", redirect_uris: [redirectUri] }),
+    });
+    const registered = (await registration.json()) as { client_id: string };
+    const baseBody = {
+      response_type: "code",
+      client_id: registered.client_id,
+      redirect_uri: redirectUri,
+      code_challenge: createHash("sha256").update(PKCE_VERIFIER).digest("base64url"),
+      code_challenge_method: "S256",
+      resource: started.url,
+      state: "state-deny",
+      username: "user@example.com",
+      password: "secret",
+    };
+
+    const denied = await fetch(`${origin}/oauth/authorize`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ ...baseBody, action: "deny" }),
+    });
+    expect(denied.status).toBe(302);
+    const denyCallback = new URL(denied.headers.get("location") ?? "");
+    expect(denyCallback.searchParams.get("error")).toBe("access_denied");
+    expect(denyCallback.searchParams.get("state")).toBe("state-deny");
+    expect(denyCallback.searchParams.get("code")).toBeNull();
+
+    // No decision at all means the consent screen was bypassed: re-render, never mint a code.
+    const noDecision = await fetch(`${origin}/oauth/authorize`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(baseBody),
+    });
+    expect(noDecision.status).toBe(400);
+    expect(noDecision.headers.get("location")).toBeNull();
+    expect(await noDecision.text()).toContain("Choose Authorize");
+
+    expect(mock.requests.filter((request) => request.path === "/api/v1/users/login")).toHaveLength(0);
+  });
+
+  it("restricts registration and authorization to allowlisted redirect origins", async () => {
+    const config = oauthTestConfig("http://127.0.0.1:1");
+    config.oauth = { ...config.oauth!, allowedRedirectOrigins: ["https://chat.example.com", "http://127.0.0.1"] };
+    started = await startServer(config);
+    const origin = new URL(started.url).origin;
+
+    const rejected = await fetch(`${origin}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name: "Attacker", redirect_uris: ["https://attacker.example/callback"] }),
+    });
+    expect(rejected.status).toBe(400);
+    await expect(rejected.json()).resolves.toMatchObject({ error: "invalid_redirect_uri" });
+
+    const accepted = await fetch(`${origin}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name: "Allowed", redirect_uris: ["https://chat.example.com/callback"] }),
+    });
+    expect(accepted.status).toBe(201);
+
+    // Native clients bind a random loopback port (RFC 8252 section 7.3), so a portless
+    // loopback allowlist entry has to match any port.
+    const loopback = await fetch(`${origin}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name: "Loopback", redirect_uris: ["http://127.0.0.1:53821/callback"] }),
+    });
+    expect(loopback.status).toBe(201);
+  });
+
+  it("invalidates already persisted clients when the redirect allowlist is tightened", () => {
+    tempDir = mkdtempSync(join(tmpdir(), "homebox-mcp-redirect-allowlist-"));
+    const storagePath = join(tempDir, "oauth-store.json");
+    const ttls = { authCodeTtlSeconds: 300, accessTokenTtlSeconds: 3600, refreshTokenTtlSeconds: 3600 };
+    const open = new OAuthStore({ ...ttls, storagePath });
+    const client = open.registerClient({ client_name: "Legacy", redirect_uris: ["https://attacker.example/callback"] });
+
+    const restricted = new OAuthStore({ ...ttls, storagePath, allowedRedirectOrigins: ["https://chat.example.com"] });
+    expect(restricted.clientDescriptor(client.client_id)?.clientName).toBe("Legacy");
+    expect(() =>
+      restricted.validateAuthorizationRequest({
+        responseType: "code",
+        clientId: client.client_id,
+        redirectUri: "https://attacker.example/callback",
+        codeChallenge: createHash("sha256").update(PKCE_VERIFIER).digest("base64url"),
+        codeChallengeMethod: "S256",
+        resource: "https://mcp.example.com/mcp",
+      }),
+    ).toThrow(/HOMEBOX_MCP_OAUTH_ALLOWED_REDIRECT_ORIGINS/);
+  });
+
+  it("validates the redirect allowlist configuration", () => {
+    expect(
+      loadConfig({
+        HOMEBOX_BASE_URL: "http://homebox.local",
+        HOMEBOX_MCP_OAUTH_ENABLED: "true",
+        HOMEBOX_MCP_PUBLIC_URL: "https://mcp.example.com/mcp",
+        HOMEBOX_MCP_OAUTH_ALLOWED_REDIRECT_ORIGINS: "https://chat.example.com, https://chat.example.com , http://127.0.0.1",
+      }).oauth?.allowedRedirectOrigins,
+    ).toEqual(["https://chat.example.com", "http://127.0.0.1"]);
+    expect(() =>
+      loadConfig({ HOMEBOX_BASE_URL: "http://homebox.local", HOMEBOX_MCP_OAUTH_ALLOWED_REDIRECT_ORIGINS: "https://chat.example.com" }),
+    ).toThrow(/requires HOMEBOX_MCP_OAUTH_ENABLED/);
+    expect(() =>
+      loadConfig({
+        HOMEBOX_BASE_URL: "http://homebox.local",
+        HOMEBOX_MCP_OAUTH_ENABLED: "true",
+        HOMEBOX_MCP_PUBLIC_URL: "https://mcp.example.com/mcp",
+        HOMEBOX_MCP_OAUTH_ALLOWED_REDIRECT_ORIGINS: "*",
+      }),
+    ).toThrow(/HOMEBOX_MCP_OAUTH_ALLOWED_REDIRECT_ORIGINS/);
+    expect(() =>
+      loadConfig({
+        HOMEBOX_BASE_URL: "http://homebox.local",
+        HOMEBOX_MCP_OAUTH_ENABLED: "true",
+        HOMEBOX_MCP_PUBLIC_URL: "https://mcp.example.com/mcp",
+        HOMEBOX_MCP_OAUTH_ALLOWED_REDIRECT_ORIGINS: "https://chat.example.com/callback",
+      }),
+    ).toThrow(/without credentials, path, query or fragment/);
   });
 
   it("binds legacy SSE message posts to the OAuth grant principal", async () => {
@@ -829,6 +1019,7 @@ describe("HTTP MCP server", () => {
         code_challenge: challenge,
         code_challenge_method: "S256",
         resource,
+        action: "allow",
         username: "user@example.com",
         password: "secret",
       }),
@@ -901,6 +1092,7 @@ async function createOAuthGrant(origin: string, resource: string, clientName: st
       code_challenge: createHash("sha256").update(PKCE_VERIFIER).digest("base64url"),
       code_challenge_method: "S256",
       resource,
+      action: "allow",
       username: "user@example.com",
       password: "secret",
     }),
@@ -948,6 +1140,10 @@ function refreshGrant(origin: string, resource: string, clientId: string, refres
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, refresh_token: refreshToken, resource }),
   });
+}
+
+function escapedHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 function testConfig(homeboxBaseUrl: string, apiToken?: string): AppConfig {

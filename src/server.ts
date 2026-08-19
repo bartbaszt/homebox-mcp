@@ -6,7 +6,7 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
@@ -398,7 +398,7 @@ function registerOAuthRoutes(app: express.Express, state: RuntimeState): void {
   app.get("/oauth/authorize", (req, res) => {
     try {
       const auth = authorizationRequest(req.query, state.oauth, resourceUrl(req, state.config));
-      res.type("html").send(renderAuthorizeForm(auth));
+      sendAuthorizePage(res, auth, { clientName: state.oauth.clientDescriptor(auth.clientId)?.clientName });
     } catch (error) {
       sendOAuthError(res, error);
     }
@@ -408,6 +408,21 @@ function registerOAuthRoutes(app: express.Express, state: RuntimeState): void {
     let auth: ReturnType<typeof authorizationRequest> | undefined;
     try {
       auth = authorizationRequest(req.body, state.oauth, resourceUrl(req, state.config));
+      const clientName = state.oauth.clientDescriptor(auth.clientId)?.clientName;
+      const decision = formValue(req.body, "action");
+
+      // The user explicitly declined, so no credential is touched and no code is minted.
+      if (decision === "deny") {
+        sendAuthorizeRedirect(res, auth, { error: "access_denied", error_description: "The user declined the authorization request" });
+        return;
+      }
+      // A missing decision means the consent screen was bypassed. Re-render it instead of
+      // treating a successful Homebox login as implicit consent for an unseen client.
+      if (decision !== "allow") {
+        sendAuthorizePage(res, auth, { clientName, error: "Choose Authorize to grant access or Cancel to decline.", status: 400 });
+        return;
+      }
+
       const username = formValue(req.body, "username");
       const password = formValue(req.body, "password");
       if (!username || !password) throw new OAuthError("invalid_request", "username and password are required");
@@ -425,14 +440,14 @@ function registerOAuthRoutes(app: express.Express, state: RuntimeState): void {
           createdAt: new Date().toISOString(),
         },
       });
-      const redirect = new URL(auth.redirectUri);
-      redirect.searchParams.set("code", code);
-      const stateParam = auth.state;
-      if (stateParam) redirect.searchParams.set("state", stateParam);
-      res.redirect(302, redirect.toString());
+      sendAuthorizeRedirect(res, auth, { code });
     } catch (error) {
       if (auth) {
-        res.status(401).type("html").send(renderAuthorizeForm(auth, "Homebox login failed. Check username and password."));
+        sendAuthorizePage(res, auth, {
+          clientName: state.oauth.clientDescriptor(auth.clientId)?.clientName,
+          error: "Homebox login failed. Check username and password.",
+          status: 401,
+        });
         return;
       }
       sendOAuthError(res, error);
@@ -579,7 +594,64 @@ function assertExpectedResource(resource: string | undefined, expectedResource: 
   if (resource !== expectedResource) throw new OAuthError("invalid_target", "resource must match this MCP server");
 }
 
-function renderAuthorizeForm(auth: ReturnType<typeof authorizationRequest>, error?: string): string {
+type AuthorizationRequestContext = ReturnType<typeof authorizationRequest>;
+
+interface AuthorizePageOptions {
+  /** Self-declared client name. Rendered as untrusted, because dynamic registration accepts any value. */
+  clientName?: string;
+  error?: string;
+  status?: number;
+}
+
+const AUTHORIZE_PAGE_STYLES = `body{font-family:system-ui,sans-serif;max-width:34rem;margin:3rem auto;padding:0 1rem;line-height:1.5}h1{font-size:1.4rem}dl{margin:1.25rem 0;padding:.75rem 1rem;border:1px solid #d0d0d8;border-radius:.5rem}dt{font-size:.8rem;text-transform:uppercase;letter-spacing:.03em;color:#55555f}dd{margin:.15rem 0 .9rem}dd:last-of-type{margin-bottom:.15rem}.host{font-size:1.05rem}.uri{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8rem;word-break:break-all;color:#40404a}.unverified{color:#55555f;font-size:.8rem}.warn{border-left:.25rem solid #b06000;background:#fff8ef;padding:.6rem .8rem;border-radius:.25rem}label{display:block;margin:.75rem 0}input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:.4rem}.note{color:#55555f;font-size:.8rem}.actions{display:flex;gap:.75rem;margin-top:1.25rem}button{padding:.55rem 1.1rem;font-size:1rem;border-radius:.35rem;border:1px solid #2b2b33;background:#2b2b33;color:#fff;cursor:pointer}button.secondary{background:#fff;color:#2b2b33}.error{color:#b00020;font-weight:600}`;
+/** CSP hash for the inline stylesheet, so the page needs no `style-src 'unsafe-inline'`. */
+const AUTHORIZE_STYLE_HASH = `'sha256-${createHash("sha256").update(AUTHORIZE_PAGE_STYLES).digest("base64")}'`;
+const CSP_SOURCE_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/[a-z0-9.-]+(:\d{1,5})?$/i;
+
+function sendAuthorizePage(res: Response, auth: AuthorizationRequestContext, options: AuthorizePageOptions = {}): void {
+  setAuthorizePageHeaders(res, auth.redirectUri);
+  res.status(options.status ?? 200).type("html").send(renderAuthorizeForm(auth, options));
+}
+
+/**
+ * Hardens the consent screen.
+ *
+ * `form-action` names the validated redirect origin as well as `'self'`, because submitting the
+ * consent form ends in a cross-origin 302 to that origin and some browsers enforce `form-action`
+ * against post-submit redirects. `'self'` alone would break the flow there.
+ */
+function setAuthorizePageHeaders(res: Response, redirectUri: string): void {
+  setNoStore(res);
+  const formAction = ["'self'", cspSource(redirectUri)].filter(Boolean).join(" ");
+  res.setHeader(
+    "Content-Security-Policy",
+    `default-src 'none'; style-src ${AUTHORIZE_STYLE_HASH}; form-action ${formAction}; base-uri 'none'; frame-ancestors 'none'`,
+  );
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+}
+
+function cspSource(uri: string): string | undefined {
+  try {
+    const origin = new URL(uri).origin;
+    return CSP_SOURCE_PATTERN.test(origin) ? origin : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Sends the user back to the client with either an authorization code or an OAuth error. */
+function sendAuthorizeRedirect(res: Response, auth: AuthorizationRequestContext, params: Record<string, string>): void {
+  setNoStore(res);
+  res.setHeader("Referrer-Policy", "no-referrer");
+  const redirect = new URL(auth.redirectUri);
+  for (const [name, value] of Object.entries(params)) redirect.searchParams.set(name, value);
+  if (auth.state) redirect.searchParams.set("state", auth.state);
+  res.redirect(302, redirect.toString());
+}
+
+function renderAuthorizeForm(auth: AuthorizationRequestContext, options: AuthorizePageOptions = {}): string {
   const hidden: Record<string, string> = {
     response_type: "code",
     client_id: auth.clientId,
@@ -593,27 +665,60 @@ function renderAuthorizeForm(auth: ReturnType<typeof authorizationRequest>, erro
   const fields = Object.entries(hidden)
     .map(([name, value]) => `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`)
     .join("\n");
+  const redirectHost = redirectDisplayHost(auth.redirectUri);
+  const clientLabel = options.clientName?.trim()
+    ? `<strong>${escapeHtml(options.clientName.trim())}</strong> <span class="unverified">(name reported by the application, not verified)</span>`
+    : `<strong>Unnamed application</strong> <span class="unverified">(the application did not provide a name)</span>`;
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Connect Homebox MCP</title>
-  <style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem}label{display:block;margin:.75rem 0}.error{color:#b00020}</style>
+  <meta name="referrer" content="no-referrer">
+  <title>Authorize access to Homebox</title>
+  <style>${AUTHORIZE_PAGE_STYLES}</style>
 </head>
 <body>
-  <h1>Connect Homebox MCP</h1>
-  <p>Sign in to the configured Homebox instance. Password is used once and is not stored by this MCP server.</p>
-  ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
+  <main>
+  <h1>Authorize access to Homebox</h1>
+  <p>An application is asking for access to your Homebox account through this MCP server.</p>
+  <dl>
+    <dt>Application</dt>
+    <dd>${clientLabel}</dd>
+    <dt>Authorization code will be sent to</dt>
+    <dd><strong class="host">${escapeHtml(redirectHost)}</strong><br><span class="uri">${escapeHtml(auth.redirectUri)}</span></dd>
+    <dt>Requested access</dt>
+    <dd>Full read and write access to your Homebox account, including items, locations, attachments and account settings (scope: <code>${escapeHtml(auth.scope)}</code>)</dd>
+    <dt>MCP server</dt>
+    <dd class="uri">${escapeHtml(auth.resource)}</dd>
+    <dt>Client ID</dt>
+    <dd class="uri">${escapeHtml(auth.clientId)}</dd>
+  </dl>
+  <p class="warn">Only the destination host above is verified. Authorize only if you started this from that application. If you reached this page from a link you did not expect, choose Cancel.</p>
+  ${options.error ? `<p class="error">${escapeHtml(options.error)}</p>` : ""}
   <form method="post" action="/oauth/authorize">
     ${fields}
-    <label>Username or email<br><input name="username" autocomplete="username" required></label>
+    <label>Username or email<br><input name="username" type="text" autocomplete="username" required></label>
     <label>Password<br><input name="password" type="password" autocomplete="current-password" required></label>
     <label><input name="stayLoggedIn" type="checkbox" value="true" checked> Stay logged in</label>
-    <button type="submit">Connect</button>
+    <p class="note">Your password is sent once to the configured Homebox instance and is not stored by this MCP server.</p>
+    <div class="actions">
+      <button type="submit" name="action" value="allow">Authorize</button>
+      <button type="submit" name="action" value="deny" class="secondary" formnovalidate>Cancel</button>
+    </div>
   </form>
+  </main>
 </body>
 </html>`;
+}
+
+function redirectDisplayHost(redirectUri: string): string {
+  try {
+    const url = new URL(redirectUri);
+    return url.port ? `${url.hostname}:${url.port}` : url.hostname;
+  } catch {
+    return redirectUri;
+  }
 }
 
 function formValue(source: unknown, key: string): string | undefined {
@@ -634,6 +739,7 @@ function sendTokenResponse(res: Response, tokens: { accessToken: string; refresh
 }
 
 function sendOAuthError(res: Response, error: unknown): void {
+  setNoStore(res);
   if (error instanceof OAuthError) {
     if (error.status === 503) res.setHeader("Retry-After", "5");
     res.status(error.status).json({ error: error.error, error_description: error.message });

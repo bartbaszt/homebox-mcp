@@ -8,6 +8,33 @@ contain breaking changes to configuration or tool contracts.
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in OAuth redirect allowlist through `HOMEBOX_MCP_OAUTH_ALLOWED_REDIRECT_ORIGINS`, enforced at
+  both dynamic client registration and authorization so tightening it also invalidates clients
+  already persisted in `oauth-store.json`.
+
+### Changed
+
+- **Breaking (OAuth clients that posted directly to `/oauth/authorize`)**: `POST /oauth/authorize`
+  now requires an explicit consent decision, `action=allow`. Browser-driven connectors are
+  unaffected; they press the new Authorize button.
+
+### Security
+
+- `/oauth/authorize` now renders an informed-consent screen before issuing an authorization code. It
+  names the requesting client (marked as client-declared and unverified), the host that will receive
+  the code, the requested scope, the MCP resource and the client ID. A successful Homebox login is no
+  longer treated as implicit consent, which closes a consent-phishing path in which a crafted
+  authorize link for an attacker-registered client obtained delegated access to the user's Homebox
+  account.
+- `Cancel` on the consent screen redirects back with `error=access_denied` and never uses the
+  submitted Homebox credentials.
+- The consent screen is served with `Content-Security-Policy` (`default-src 'none'`, hashed inline
+  stylesheet, `form-action 'self' <redirect-origin>`, `base-uri 'none'`, `frame-ancestors 'none'`),
+  `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` and
+  `Cache-Control: no-store`.
+
 ## [0.1.0] - 2026-08-18
 
 First tagged release. Container images are now public on GHCR and versioned; `latest` follows

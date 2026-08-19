@@ -31,6 +31,20 @@ export interface OAuthStoreOptions {
   storagePath?: string;
   maxClients?: number;
   maxRecords?: number;
+  /**
+   * Optional allowlist of redirect origins. When set, dynamic client registration and every
+   * authorization request are restricted to these origins, which closes the consent-phishing
+   * vector that open registration otherwise leaves available on a public deployment.
+   */
+  allowedRedirectOrigins?: string[];
+}
+
+/** Non-secret client metadata rendered on the consent screen. */
+export interface OAuthClientDescriptor {
+  clientId: string;
+  /** Self-declared by the client at registration time. Never verified; display as untrusted. */
+  clientName?: string;
+  registeredAt: number;
 }
 
 export interface RegisteredOAuthClient {
@@ -122,10 +136,12 @@ export class OAuthStore {
   private readonly rotations = new Map<string, number>();
   private readonly maxClients: number;
   private readonly maxRecords: number;
+  private readonly allowedRedirectOrigins?: string[];
 
   constructor(private readonly options: OAuthStoreOptions) {
     this.maxClients = options.maxClients ?? DEFAULT_MAX_CLIENTS;
     this.maxRecords = options.maxRecords ?? DEFAULT_MAX_RECORDS;
+    this.allowedRedirectOrigins = options.allowedRedirectOrigins?.length ? [...options.allowedRedirectOrigins] : undefined;
     if (!Number.isInteger(this.maxClients) || this.maxClients <= 0 || !Number.isInteger(this.maxRecords) || this.maxRecords <= 0) {
       throw new OAuthError("server_error", "OAuth client and token capacities must be positive integers", 500);
     }
@@ -147,6 +163,7 @@ export class OAuthStore {
       throw new OAuthError("invalid_client_metadata", "Only token_endpoint_auth_method=none is supported");
     }
     const validatedRedirectUris = [...new Set(redirectUris.map((uri) => validateClientRedirectUri(uri)))];
+    for (const redirectUri of validatedRedirectUris) this.assertAllowedRedirectOrigin(redirectUri);
     const clientName = optionalClientName(data.client_name);
     const now = Date.now();
     this.pruneExpired(now);
@@ -197,11 +214,26 @@ export class OAuthStore {
     const client = this.clients.get(clientId);
     if (!client) throw new OAuthError("invalid_client", "Unknown OAuth client", 401);
     if (!client.redirect_uris.includes(redirectUri)) throw new OAuthError("invalid_request", "redirect_uri is not registered for this client");
+    // Re-checked here (not only at registration) so tightening the allowlist also invalidates
+    // clients that were already persisted in the OAuth store under a looser configuration.
+    this.assertAllowedRedirectOrigin(redirectUri);
     if (codeChallengeMethod !== "S256") throw new OAuthError("invalid_request", "Only PKCE S256 is supported");
     if (!/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) throw new OAuthError("invalid_request", "code_challenge must be a 43-character PKCE S256 value");
     validateResource(resource);
 
     return { clientId, redirectUri, codeChallenge, codeChallengeMethod, resource, scope };
+  }
+
+  /**
+   * Non-secret client metadata for the consent screen.
+   *
+   * Deliberately separate from `validateAuthorizationRequest`: that result is spread straight into
+   * `createAuthorizationCode`, so any field added there would leak into the persisted code record.
+   */
+  clientDescriptor(clientId: string): OAuthClientDescriptor | undefined {
+    const client = this.clients.get(clientId);
+    if (!client) return undefined;
+    return { clientId: client.client_id, clientName: client.client_name, registeredAt: client.client_id_issued_at };
   }
 
   createAuthorizationCode(input: AuthorizationCodeInput): string {
@@ -493,6 +525,16 @@ export class OAuthStore {
     }
   }
 
+  private assertAllowedRedirectOrigin(redirectUri: string): void {
+    const allowed = this.allowedRedirectOrigins;
+    if (!allowed) return;
+    if (redirectOriginAllowed(allowed, redirectUri)) return;
+    throw new OAuthError(
+      "invalid_redirect_uri",
+      "redirect_uri origin is not allowed by this MCP server. Ask the operator to add it to HOMEBOX_MCP_OAUTH_ALLOWED_REDIRECT_ORIGINS.",
+    );
+  }
+
   private migrateLegacyPrincipals(): boolean {
     const principals = new Map<string, string>();
     let migrated = false;
@@ -582,11 +624,46 @@ function required(value: string | undefined, name: string): string {
   return value;
 }
 
+const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "::1"];
+
+function redirectHostname(url: URL): string {
+  return url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+}
+
+/**
+ * Exact scheme+host+port match against the configured allowlist.
+ *
+ * Loopback entries without an explicit port match any port, because native clients bind a random
+ * loopback port per RFC 8252 section 7.3.
+ */
+function redirectOriginAllowed(allowedOrigins: string[], redirectUri: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(redirectUri);
+  } catch {
+    return false;
+  }
+  const host = redirectHostname(url);
+  const loopback = LOOPBACK_HOSTS.includes(host);
+  return allowedOrigins.some((entry) => {
+    let allowed: URL;
+    try {
+      allowed = new URL(entry);
+    } catch {
+      return false;
+    }
+    if (allowed.protocol !== url.protocol) return false;
+    if (redirectHostname(allowed) !== host) return false;
+    if (loopback && !allowed.port) return true;
+    return allowed.port === url.port;
+  });
+}
+
 function validateRedirectUri(raw: string): string {
   try {
     const url = new URL(raw);
-    const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-    const loopback = ["localhost", "127.0.0.1", "::1"].includes(hostname);
+    const hostname = redirectHostname(url);
+    const loopback = LOOPBACK_HOSTS.includes(hostname);
     if (url.username || url.password || url.hash) throw new OAuthError("invalid_client_metadata", "redirect_uri must not include credentials or a fragment");
     if (url.protocol === "https:" || (url.protocol === "http:" && loopback)) return url.toString();
     throw new OAuthError("invalid_client_metadata", "redirect_uris must use HTTPS unless localhost");
