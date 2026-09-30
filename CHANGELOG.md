@@ -8,6 +8,22 @@ contain breaking changes to configuration or tool contracts.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-30
+
+### Security
+
+- Bumped `ip-address` to 10.7.2 (transitive via `@modelcontextprotocol/sdk` -> `express-rate-limit`).
+  Fixes four moderate-severity advisories affecting `<=10.7.0`: `Address6.isLinkLocal()` recognized
+  `fe80::/64` instead of `fe80::/10`; no classifier recognized the NAT64 local-use range
+  `64:ff9b:1::/48`; `isInSubnet()` and `isHostInSubnet()` compared addresses of different families as
+  if they shared an address space, so an allowlist check could admit an address outside its range;
+  and `Address6` built a parse diagnostic proportional to input length with no bound. Combined, these
+  allowed SSRF and trust-boundary bypass against this server's own address allowlisting, plus a
+  single-request stall. This server does not depend on `ip-address` for its own SSRF checks, so
+  exposure was limited to the shared `express-rate-limit` dependency.
+- Bumped `fast-uri` to 3.1.8 (transitive via `@modelcontextprotocol/sdk` -> `ajv`), fixing
+  inconsistent host case normalization via percent-encoded octets.
+
 ## [0.2.0] - 2026-08-19
 
 Security release. OAuth authorization now requires an explicit, informed consent step.
