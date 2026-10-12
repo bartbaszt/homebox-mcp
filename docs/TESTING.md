@@ -1,5 +1,16 @@
 # Testing
 
+## Agent Verification Cadence
+
+Use the smallest existing test that exercises a change, while preserving the final full-suite gate:
+
+- **Change:** run the affected `tests/integration/*.test.ts` file with `npx vitest run <existing-test-path>`. Use `npm run build` for type or interface changes; record gaps when no focused test exists.
+- **Batch:** run broader affected integration tests (or `npm test` when the impact is cross-cutting), and `npm run build` when applicable.
+- **Regression:** rerun the reproduced failure and adjacent affected tests after a fix.
+- **Verify:** run `npm run check` against the final state, plus the opt-in real E2E suite below when required and authorized.
+
+Capture actual commands and results. A targeted PASS only covers its tested behavior and exact revision; subsequent relevant changes invalidate earlier verification evidence. Never automatically enable real Homebox E2E or destructive operations.
+
 ## Mocked Integration Tests
 
 Run:
